@@ -18,6 +18,8 @@
       </select>
       <span class="lbl">workers</span>
       <input class="inp tok" type="number" min="1" max="64" [ngModel]="workersN()" (ngModelChange)="workersN.set($event)" />
+      <span class="lbl" title="Repeat the whole plan N times inside this run — per-step identities carry rep k/N (review M2)">repeats</span>
+      <input class="inp tok" type="number" min="1" max="10" [ngModel]="repeatsN()" (ngModelChange)="repeatsN.set($event)" />
       <span class="lbl">label</span>
       <input class="inp lab" [ngModel]="label()" (ngModelChange)="label.set($event)" placeholder="defaults to the test title" />
       <button class="btn primary" (click)="start()" [disabled]="starting() || !testId()">{{ starting() ? 'starting…' : 'Start run' }}</button>
@@ -41,6 +43,7 @@
         @if (!r.finished) {
           <button class="btn danger" (click)="stop(r.id)">Stop</button>
         }
+        <button class="btn" (click)="runAgain(r)" title="Fill the form with this run's recorded configuration">Run again</button>
         <button class="btn" (click)="openReport(r.session)">Report</button>
       </div>
       @if (r.steps > 0) {
@@ -58,15 +61,31 @@
         <span>workers {{ r.workers }}</span>
         <span>running {{ runningCount(r) }}</span>
         <span>done {{ doneCount(r) }}</span>
-        <span class="strong">Σ {{ sumTokS(r).toFixed(1) }} tok/s</span>
+        @if (hasRates(r)) {
+          <span class="strong" title="Σ of the workers' sustained decode rates — workers with fewer than 2 tokens have no measurable rate and are excluded">Σ {{ sumTokS(r).toFixed(1) }} tok/s</span>
+        } @else {
+          <span class="dim" title="A rate needs at least 2 tokens per worker: one token has no inter-token interval to measure">Σ tok/s insufficient data</span>
+        }
         <span>{{ fmtN(sumTokens(r)) }} tok total</span>
       </div>
       <div class="grid">
         @for (w of r.snaps; track w.idx) {
           <div class="wcard" [class.wrun]="w.state === 'streaming'" [class.wdone]="w.state === 'done'" [class.wfail]="w.state === 'failed'">
-            <div class="wline"><span class="widx mono">#{{ w.idx + 1 }}</span><span class="wstate small" [class]="'small ' + stateClass(w.state)">{{ w.state }}</span></div>
+            <div class="wline">
+              <span class="widx mono">#{{ w.idx + 1 }}</span>
+              <span class="wstate small" [class]="'small ' + stateClass(w.state)">{{ w.state }}</span>
+              @if (w.assert_pass === true) {
+                <span class="wassert ok" title="Answer assertion passed — the expected output was produced">✓ assert</span>
+              } @else if (w.assert_pass === false) {
+                <span class="wassert fail" title="Answer assertion FAILED — the expected output was not produced">✗ assert</span>
+              }
+            </div>
             <div class="wstats mono">
-              <span class="strong">{{ (w.state === 'done' ? (w.final_tok_s ?? 0) : w.tok_s || 0).toFixed(1) }}</span> tok/s
+              @if (rateOf(w) != null) {
+                <span class="strong">{{ rateOf(w)!.toFixed(1) }}</span> tok/s
+              } @else {
+                <span class="dim" title="Fewer than 2 tokens: no sustained rate can be measured">rate n/a</span>
+              }
               <span class="dim">·</span>
               {{ fmtN(maxTok(w)) }} tok
             </div>

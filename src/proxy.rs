@@ -112,6 +112,14 @@ pub fn build_payload(
         mcfg.and_then(|m| m.params.iter().find(|p| p.key == "temperature"))
             .and_then(|p| p.value.as_f64())
     });
+    // ONE source of truth: when the struct field carries the temperature it
+    // must NOT also sit in the flattened params map — serde would emit the
+    // key twice and strict engines reject the body (observed: HTTP 422
+    // "duplicate field `temperature`" with an explicit temperature on the
+    // model entry).
+    if temperature.is_some() {
+        extra.remove("temperature");
+    }
 
     tracing::debug!(model = %model, uid = ?req.model_uid, params = ?extra, "effective payload params");
     let stream = desired_stream && !req.no_stream;
@@ -269,5 +277,79 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..n])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::ChatMessage;
+    use serde_json::Value;
+
+    fn provider_with_temp_param() -> Provider {
+        Provider {
+            id: "p".into(),
+            name: "P".into(),
+            base_url: "http://localhost:1/v1".into(),
+            api_key: None,
+            models: vec![ModelConfig {
+                id: "m".into(),
+                uid: "u".into(),
+                label: None,
+                last_check: None,
+                params: vec![ParamOverride { key: "temperature".into(), value: Value::from(0.0) }],
+                reasoning_enabled: false,
+                reasoning_effort: None,
+                tokenizer: None,
+                live_calibration: None,
+            }],
+        }
+    }
+
+    /// Regression: an explicit temperature on the model entry used to be
+    /// emitted TWICE (struct field + flattened params) and strict engines
+    /// rejected the body with HTTP 422 duplicate field.
+    #[test]
+    fn explicit_model_temperature_serializes_once() {
+        let p = provider_with_temp_param();
+        let req = StreamRequest {
+            model_uid: Some("u".into()),
+            provider_id: "p".into(),
+            model: "m".into(),
+            messages: vec![ChatMessage { role: "user".into(), content: Value::String("hi".into()), name: None }],
+            reasoning_enabled: Some(false),
+            reasoning_effort: None,
+            overrides: vec![],
+            temperature: None,
+            no_stream: false,
+        };
+        let payload = build_payload(&p, "m", &req, false);
+        let json = serde_json::to_string(&payload).unwrap();
+        let count = json.matches(r#""temperature""#).count();
+        assert_eq!(count, 1, "temperature must appear exactly once: {json}");
+        assert!(json.contains(r#""temperature":0.0"#), "value must survive: {json}");
+    }
+
+    /// Request-level override + model param: still exactly one key, and the
+    /// request value wins.
+    #[test]
+    fn request_temperature_overrides_model_param_single_key() {
+        let p = provider_with_temp_param();
+        let req = StreamRequest {
+            model_uid: Some("u".into()),
+            provider_id: "p".into(),
+            model: "m".into(),
+            messages: vec![ChatMessage { role: "user".into(), content: Value::String("hi".into()), name: None }],
+            reasoning_enabled: Some(false),
+            reasoning_effort: None,
+            overrides: vec![crate::settings::ParamOverride { key: "temperature".into(), value: Value::from(0.7) }],
+            temperature: Some(0.7),
+            no_stream: false,
+        };
+        let payload = build_payload(&p, "m", &req, false);
+        let json = serde_json::to_string(&payload).unwrap();
+        let count = json.matches(r#""temperature""#).count();
+        assert_eq!(count, 1, "exactly one temperature key: {json}");
+        assert!(json.contains("0.7"), "request value wins: {json}");
     }
 }

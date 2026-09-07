@@ -112,12 +112,14 @@ export function sampleBadge(n: number): { label: string; level: SampleLevel } {
  * Distribution-free 95% CI for the median (order statistics): the median's
  * rank is Binomial(n, 0.5); take ±1.96 standard deviations of that rank.
  * O(1) vs bootstrapping — safe for n in the hundreds of thousands.
- * `sorted` must be ascending. Returns null when there is no data.
+ * `sorted` must be ascending. Returns null when there is no data — or when
+ * n < 8: an order-statistic interval on a handful of samples is meaningless
+ * and used to render as a confident "±0.0" next to a LOW SAMPLE badge
+ * (review A6). No interval is claimed until there is enough data.
  */
 export function medianCI(sorted: number[]): [number, number] | null {
   const n = sorted.length;
-  if (!n) return null;
-  if (n < 8) return [sorted[0], sorted[n - 1]];
+  if (n < 8) return null;
   const m = n >> 1;
   const se = Math.sqrt(n) / 2;
   const k1 = Math.max(0, Math.floor(m - 1.96 * se));

@@ -5,6 +5,10 @@
       <span class="chip">⚡ {{ live().tok_s.toFixed(1) }} tok/s</span>
       <span class="chip">TTFT {{ fmtMs(live().ttft_ms) }}</span>
       <span class="chip">tokens {{ live().tokens.toFixed(0) }}</span>
+      <button class="metrics-toggle" (click)="toggleMetrics()"
+              [title]="metricsOpen() ? 'Hide the live metrics panel' : 'Show the live metrics panel'">
+        {{ metricsOpen() ? 'Metrics ▸' : 'Metrics ◂' }}
+      </button>
     </div>
   </div>
 
@@ -45,9 +49,11 @@
             <div class="msg assistant">
               <div class="bubble">
                 @if (m.reasoning) {
-                  <!-- Run complete: reasoning is kept and the user may expand it. -->
+                  <!-- Run complete: reasoning is kept and the user may expand it.
+                       An unknown count shows without a number — zero means
+                       measured zero, not missing data (review F5). -->
                   <details class="thinking">
-                    <summary>💭 thinking · {{ m.reasoningTokens ?? 0 }} tok</summary>
+                    <summary>💭 thinking{{ m.reasoningTokens != null ? ' · ' + m.reasoningTokens + ' tok' : '' }}</summary>
                     <div class="thinking-body" [appMarkdown]="m.reasoning"></div>
                   </details>
                 }
@@ -105,13 +111,20 @@
             <div class="tp-bar-fill" [style.width.%]="tr.total ? (tr.done / tr.total) * 100 : 0"></div>
           </div>
           <div class="tp-line2">
-            <span class="mono">{{ tr.done }}/{{ tr.total }}</span>
-            <span class="muted">·</span>
+            @if (tr.finished) {
+              <span class="mono">{{ tr.reqTotal }}/{{ tr.reqTotal }} requests complete</span>
+            } @else {
+              <span class="mono">Request {{ tr.reqDone + 1 }} of {{ tr.reqTotal }}</span>
+            }
+            <span class="muted">—</span>
             <span>{{ tr.section }}</span>
-            <span class="muted small">{{ tr.finished ? 'complete' : (session.streaming() ? 'streaming…' : 'running…') }}</span>
+            <span class="muted small">{{ tr.finished ? '' : (session.streaming() ? 'streaming…' : 'running…') }}</span>
             <span class="tp-actions">
               @if (tr.finished) {
-                <button class="btn" (click)="session.testClose()">Close</button>
+                @if (tr.session) {
+                  <button class="btn" (click)="viewModelReport(tr.session)" title="Open the saved analytics report for this run">View saved report</button>
+                }
+                <button class="btn" (click)="session.testClose()" title="Clear the panel and start a fresh chat">Return to chat</button>
               } @else {
                 <button class="btn danger" (click)="stopTest()">Stop</button>
               }
@@ -151,7 +164,7 @@
             (paste)="onPaste($event)"
           ></textarea>
           @if (streaming()) {
-            <button class="stop" (click)="stop()">⏹ Stop</button>
+            <button class="stop" (click)="stop()" [disabled]="stopping()" [title]="stopping() ? 'Cancellation requested — waiting for the server to confirm' : 'Stop generating and cancel this request'">{{ stopping() ? 'Stopping…' : '⏹ Stop' }}</button>
           } @else {
             <button class="send" [disabled]="fillK === 0 && !input.trim() && !pendingImages().length" (click)="send()">Send</button>
           }
@@ -160,7 +173,7 @@
       }
     </div>
 
-    <aside class="chat-right">
+    <aside class="chat-right" [class.hidden]="!metricsOpen()">
       @if (hasModel()) {
         <app-stats-panel [scope]="'chat'"></app-stats-panel>
       } @else {

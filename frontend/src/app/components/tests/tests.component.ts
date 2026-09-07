@@ -3,6 +3,7 @@ import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
 import { ApiService } from '../../services/api.service';
 import { ChatSessionService } from '../../services/chat-session.service';
+import { TestDraftService } from '../../services/test-draft.service';
 import { TestDef, TestStep, TestStepType } from '../../types';
 
 export const CONTEXT_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 384, 512];
@@ -17,6 +18,13 @@ export function validateTest(t: TestDef): string | null {
     const at = `step ${i + 1}`;
     if (s.type === 'section' && !(s.title ?? '').trim()) return `${at}: a Section needs a title.`;
     if (s.type === 'prompt' && !(s.text ?? '').trim()) return `${at}: a Prompt must not be empty.`;
+    if ((s.expectRegex ?? '').trim()) {
+      try {
+        new RegExp((s.expectRegex ?? '').trim());
+      } catch (e: any) {
+        return `${at}: invalid expected regex: ${e?.message || e}`;
+      }
+    }
     if (s.type === 'context' && !CONTEXT_SIZES.includes(s.k ?? 0)) {
       return `${at}: context size must be one of ${CONTEXT_SIZES.join(', ')} K.`;
     }
@@ -36,23 +44,27 @@ export function validateTest(t: TestDef): string | null {
   styleUrl: './tests.component.css',
 })
 export class TestsComponent implements OnInit {
-  tests = signal<TestDef[]>([]);
   filterText = signal('');
-  filterKind = signal<'all' | 'built-in' | 'mine'>('all');
-
-  /** Deep copy being edited (null = show the index). */
-  editing = signal<TestDef | null>(null);
-  editMode = signal<'ui' | 'json'>('ui');
-  jsonText = signal('');
   jsonError = signal('');
   saving = signal(false);
 
   readonly contextSizes = CONTEXT_SIZES;
 
+  // Draft state (editing / editMode / jsonText / tests / filterKind) lives in
+  // the root TestDraftService (review F4): navigating away no longer discards
+  // unsaved edits — returning to Tests restores the exact editor state.
+  get tests() { return this.draft.tests; }
+  get filterKind() { return this.draft.filterKind; }
+  get editing() { return this.draft.editing; }
+  get editMode() { return this.draft.editMode; }
+  get jsonText(): string { return this.draft.jsonText(); }
+  set jsonText(v: string) { this.draft.jsonText.set(v); }
+
   constructor(
     private api: ApiService,
     private chat: ChatSessionService,
     private router: Router,
+    private draft: TestDraftService,
   ) {}
 
   /** Image files for Image steps (name + byte size — selection is by size). */
@@ -115,6 +127,11 @@ export class TestsComponent implements OnInit {
   // ---------- index actions ----------
 
   startNew(): void {
+    // An existing unsaved draft must not be lost to a silent overwrite (F4).
+    const cur = this.editing();
+    if (cur && !this.readonly_() && cur.title.trim()) {
+      if (!confirm('Start a new test? The current unsaved draft will be discarded.')) return;
+    }
     this.editing.set({
       id: (crypto?.randomUUID?.() ?? `test-${Date.now()}`),
       title: '',
@@ -148,6 +165,10 @@ export class TestsComponent implements OnInit {
   }
 
   startEdit(t: TestDef): void {
+    const cur = this.editing();
+    if (cur && !this.readonly_() && cur.title.trim()) {
+      if (!confirm(`Open "${t.title}"? The current unsaved draft will be discarded.`)) return;
+    }
     this.editing.set(JSON.parse(JSON.stringify(t)));
     this.editMode.set('ui');
     this.jsonError.set('');
@@ -261,7 +282,7 @@ export class TestsComponent implements OnInit {
   toJsonMode(): void {
     const e = this.editing();
     if (!e) return;
-    this.jsonText.set(JSON.stringify(this.toWire(e), null, 2));
+    this.jsonText = JSON.stringify(this.toWire(e), null, 2);
     this.jsonError.set('');
     this.editMode.set('json');
   }
@@ -304,7 +325,7 @@ export class TestsComponent implements OnInit {
   applyJson(): void {
     let parsed: any;
     try {
-      parsed = JSON.parse(this.jsonText());
+      parsed = JSON.parse(this.jsonText);
     } catch (err: any) {
       this.jsonError.set('Invalid JSON: ' + err.message);
       return;
@@ -360,7 +381,7 @@ export class TestsComponent implements OnInit {
     try {
       await this.api.saveTest(e);
       await this.load();
-      this.editing.set(null);
+      this.draft.clear();
     } catch (ex: any) {
       alert('Save failed: ' + (ex?.message ?? ex));
     } finally {
@@ -369,6 +390,10 @@ export class TestsComponent implements OnInit {
   }
 
   cancel(): void {
-    this.editing.set(null);
+    const e = this.editing();
+    if (e && !this.readonly_()) {
+      if (!confirm('Discard the unsaved draft?')) return;
+    }
+    this.draft.clear();
   }
 }

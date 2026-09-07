@@ -45,6 +45,22 @@ pub struct Benchmark {
     /// reasoning was off).
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Lifecycle of this turn: "complete" | "cancelled" (user Stop) | absent
+    /// on very old records (treated as complete).
+    #[serde(default)]
+    pub status: Option<String>,
+    /// The wire-level run id this record was produced by (cancellation and
+    /// cross-referencing).
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// Result-assertion verdict for this turn, when the issuing step carried
+    /// one (review M1: transport completion ≠ answer correctness).
+    #[serde(default)]
+    pub assertion: Option<Assertion>,
+    /// Effective generation budget (max_tokens override) for this request,
+    /// when one was set. Absent = provider/model default.
+    #[serde(default)]
+    pub gen_budget: Option<u64>,
 
     pub prompt: String,
     #[serde(default)]
@@ -64,6 +80,22 @@ pub struct Benchmark {
     /// Extra run metadata (per-test assertions, task ids, etc.).
     #[serde(default)]
     pub meta: serde_json::Value,
+}
+
+/// Result-assertion verdict (review M1): what the step expected and whether
+/// the visible output satisfied it. Absent = no assertion was configured.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Assertion {
+    /// Expected substring of the visible output.
+    #[serde(default)]
+    pub expect: String,
+    /// Expected regex for the visible output.
+    #[serde(default)]
+    pub expect_regex: String,
+    pub pass: bool,
+    /// Why it failed / what it matched (empty on pass with substring only).
+    #[serde(default)]
+    pub detail: String,
 }
 
 /// A contiguous labelled region of the generated output.
@@ -106,6 +138,14 @@ pub struct GenStats {
     /// (falls back to estimated tokens when the server omits usage).
     #[serde(default)]
     pub final_tok_s: Option<f64>,
+    /// Provider finish reason for this turn ("stop" | "length" | …) when
+    /// reported. "length" = the output hit the generation budget (truncated).
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+    /// Absolute epoch-ms timestamp of the request start — the true t=0 of
+    /// this turn's timeline (token event times are relative to it).
+    #[serde(default)]
+    pub started_at_ms: Option<f64>,
     /// Live (estimated) average over the run.
     #[serde(default)]
     pub live_avg_tok_s: Option<f64>,

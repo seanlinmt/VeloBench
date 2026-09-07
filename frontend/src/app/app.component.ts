@@ -41,6 +41,21 @@ export class AppComponent implements OnInit, AfterViewChecked {
   readonly configs = computed(() => this.settingsService.availableConfigs());
   readonly currentConfigKey = computed(() => this.settingsService.currentConfigKey());
 
+  /** Phone-width navigation drawer (< 700px): off-canvas sidebar. Opening is
+   *  always an explicit tap; any navigation or backdrop tap closes it. */
+  readonly navOpen = signal(false);
+  toggleNav(): void {
+    this.navOpen.update((v) => !v);
+  }
+  closeNav(): void {
+    this.navOpen.set(false);
+  }
+
+  /** True when the route matches a nav path (for aria-current). */
+  isActive(path: string): boolean {
+    return this.router.isActive(path, { paths: 'exact', fragment: 'ignored', matrixParams: 'ignored', queryParams: 'ignored' });
+  }
+
   /** Favorite tests for the top-bar dropdown (built-ins and user tests). */
   readonly favs = signal<TestDef[]>([]);
   favSel = '';

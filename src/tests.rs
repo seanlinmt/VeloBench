@@ -49,6 +49,14 @@ pub struct TestStep {
     /// (low / medium / high / xhigh / …).
     #[serde(default, rename = "reasoningEffort")]
     pub reasoning_effort: String,
+    /// Result assertion (review M1): a substring the VISIBLE output must
+    /// contain. Empty = no assertion.
+    #[serde(default, rename = "expect")]
+    pub expect: String,
+    /// Result assertion: a regex the visible output must match. Empty = no
+    /// assertion. Invalid regexes are rejected at validation time.
+    #[serde(default, rename = "expectRegex")]
+    pub expect_regex: String,
     /// Sections only: when true the section starts a new LLM session (clears
     /// the conversation history). When false it is just a progress marker and
     /// the conversation continues.
@@ -103,6 +111,7 @@ pub fn validate(t: &TestDef) -> Result<(), String> {
                 if s.text.trim().is_empty() {
                     return Err(format!("{}: a Prompt must not be empty.", at));
                 }
+                validate_assertions(s, &at)?;
             }
             "image" => {
                 if s.image.trim().is_empty() {
@@ -110,6 +119,7 @@ pub fn validate(t: &TestDef) -> Result<(), String> {
                 }
             }
             "bench" => {
+                validate_assertions(s, &at)?;
                 if s.tg == 0 {
                     return Err(format!("{}: bench tg (generation tokens) must be at least 1.", at));
                 }
@@ -145,6 +155,20 @@ pub fn validate(t: &TestDef) -> Result<(), String> {
     Ok(())
 }
 
+/// Shared assertion-field validation (review M1): an expected substring must
+/// not be empty and a regex must actually compile — a typo'd regex would
+/// otherwise silently fail every run.
+fn validate_assertions(s: &TestStep, at: &str) -> Result<(), String> {
+    if !s.expect.trim().is_empty() && s.expect.trim().is_empty() {
+        return Err(format!("{at}: expected answer must not be empty.",));
+    }
+    if !s.expect_regex.trim().is_empty() {
+        regex::Regex::new(s.expect_regex.trim())
+            .map_err(|e| format!("{at}: invalid expected regex: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Built-in tests: seeded on boot, marked prebuilt (view/run only).
 pub fn prebuilt() -> Vec<TestDef> {
     let mk = |id: &str,
@@ -167,18 +191,22 @@ pub fn prebuilt() -> Vec<TestDef> {
         steps,
     };
     // Built-in sections reset the context: each one is a separate sub-test.
-    let section = |t: &str| TestStep { kind: "section".into(), title: t.into(), text: String::new(), k: 0, reset: true, depth: 0, pp: 0, tg: 0, exact_tg: false, image: String::new(), prompt: String::new(), reasoning_effort: String::new() };
-    let prompt = |t: &str| TestStep { kind: "prompt".into(), title: String::new(), text: t.into(), k: 0, reset: false, depth: 0, pp: 0, tg: 0, exact_tg: false, image: String::new(), prompt: String::new(), reasoning_effort: String::new() };
+    let section = |t: &str| TestStep { kind: "section".into(), title: t.into(), text: String::new(), k: 0, reset: true, depth: 0, pp: 0, tg: 0, exact_tg: false, image: String::new(), prompt: String::new(), reasoning_effort: String::new(), expect: String::new(), expect_regex: String::new() };
+    let prompt = |t: &str| TestStep { kind: "prompt".into(), title: String::new(), text: t.into(), k: 0, reset: false, depth: 0, pp: 0, tg: 0, exact_tg: false, image: String::new(), prompt: String::new(), reasoning_effort: String::new(), expect: String::new(), expect_regex: String::new() };
     // Prompt step with a generation budget (max_tokens override).
-    let prompt_tg = |t: &str, tg: u32| TestStep { kind: "prompt".into(), title: String::new(), text: t.into(), k: 0, reset: false, depth: 0, pp: 0, tg, exact_tg: false, image: String::new(), prompt: String::new(), reasoning_effort: String::new() };
+    let prompt_tg = |t: &str, tg: u32| TestStep { kind: "prompt".into(), title: String::new(), text: t.into(), k: 0, reset: false, depth: 0, pp: 0, tg, exact_tg: false, image: String::new(), prompt: String::new(), reasoning_effort: String::new(), expect: String::new(), expect_regex: String::new() };
+    // Prompt step with a generation budget AND a result assertion.
+    let prompt_expect = |t: &str, tg: u32, expect: &str| TestStep { kind: "prompt".into(), title: String::new(), text: t.into(), k: 0, reset: false, depth: 0, pp: 0, tg, exact_tg: false, image: String::new(), prompt: String::new(), reasoning_effort: String::new(), expect: expect.into(), expect_regex: String::new() };
+    // Prompt step asserting via regex (phrasing-tolerant expectations).
+    let prompt_expect_re = |t: &str, tg: u32, re: &str| TestStep { kind: "prompt".into(), title: String::new(), text: t.into(), k: 0, reset: false, depth: 0, pp: 0, tg, exact_tg: false, image: String::new(), prompt: String::new(), reasoning_effort: String::new(), expect: String::new(), expect_regex: re.into() };
     // Vision step: ONE image (from the embedded test images) + prompt.
-    let image = |name: &str, prompt: &str, tg: u32| TestStep { kind: "image".into(), title: String::new(), text: String::new(), k: 0, reset: false, depth: 0, pp: 0, tg, exact_tg: false, image: name.into(), prompt: prompt.into(), reasoning_effort: String::new() };
+    let image = |name: &str, prompt: &str, tg: u32| TestStep { kind: "image".into(), title: String::new(), text: String::new(), k: 0, reset: false, depth: 0, pp: 0, tg, exact_tg: false, image: name.into(), prompt: prompt.into(), reasoning_effort: String::new(), expect: String::new(), expect_regex: String::new() };
     // Prompt step with generation budget AND a reasoning override.
-    let prompt_effort = |t: &str, tg: u32, effort: &str| TestStep { kind: "prompt".into(), title: String::new(), text: t.into(), k: 0, reset: false, depth: 0, pp: 0, tg, exact_tg: false, image: String::new(), prompt: String::new(), reasoning_effort: effort.into() };
-    let context = |k: u32| TestStep { kind: "context".into(), title: String::new(), text: String::new(), k, reset: false, depth: 0, pp: 0, tg: 0, exact_tg: false, image: String::new(), prompt: String::new(), reasoning_effort: String::new() };
+    let prompt_effort = |t: &str, tg: u32, effort: &str| TestStep { kind: "prompt".into(), title: String::new(), text: t.into(), k: 0, reset: false, depth: 0, pp: 0, tg, exact_tg: false, image: String::new(), prompt: String::new(), reasoning_effort: effort.into(), expect: String::new(), expect_regex: String::new() };
+    let context = |k: u32| TestStep { kind: "context".into(), title: String::new(), text: String::new(), k, reset: false, depth: 0, pp: 0, tg: 0, exact_tg: false, image: String::new(), prompt: String::new(), reasoning_effort: String::new(), expect: String::new(), expect_regex: String::new() };
     // Fixed-shape run: one request with `depth` corpus tokens of
     // context + `pp` measured prompt tokens, generating `tg` tokens.
-    let bench = |depth: u32, pp: u32, tg: u32| TestStep { kind: "bench".into(), title: String::new(), text: String::new(), k: 0, reset: false, depth, pp, tg, exact_tg: false, image: String::new(), prompt: String::new(), reasoning_effort: String::new() };
+    let bench = |depth: u32, pp: u32, tg: u32| TestStep { kind: "bench".into(), title: String::new(), text: String::new(), k: 0, reset: false, depth, pp, tg, exact_tg: false, image: String::new(), prompt: String::new(), reasoning_effort: String::new(), expect: String::new(), expect_regex: String::new() };
     vec![
         mk(
             "prebuilt-sanity",
@@ -189,12 +217,19 @@ pub fn prebuilt() -> Vec<TestDef> {
             None,
             vec![
                 section("Warm-up"),
-                prompt("Reply with exactly: OK"),
+                prompt_expect("Reply with exactly: OK", 0, "OK"),
                 section("Arithmetic"),
-                prompt("What is 2+2? Answer with just the number."),
-                prompt("What is 12*7? Answer with just the number."),
+                prompt_expect("What is 2+2? Answer with just the number.", 0, "4"),
+                prompt_expect("What is 12*7? Answer with just the number.", 0, "84"),
                 section("Reasoning"),
-                prompt("A bat and a ball cost 1.10 in total. The bat costs 1.00 more than the ball. How much does the ball cost? Answer briefly."),
+                prompt_expect_re(
+                    "A bat and a ball cost 1.10 in total. The bat costs 1.00 more than the ball. How much does the ball cost? Answer briefly.",
+                    0,
+                    // Phrasing-tolerant: "5 cents", "$0.05", "0.05" — while
+                    // the classic wrong answers ("10 cents", "$0.10") fail.
+                    // NOTE: no (?i) — the FE validation mirror uses JS RegExp.
+                    r"(5\s*[Cc]ents|\$?0\.05\b|5¢)",
+                ),
             ],
         ),
         mk(

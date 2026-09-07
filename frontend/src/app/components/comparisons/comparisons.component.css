@@ -93,8 +93,15 @@
 }
 
 .srow {
-  padding: 8px 10px;
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
   border-bottom: 1px solid rgba(42, 51, 70, 0.4);
+  color: inherit;
+  font: inherit;
+  padding: 8px 10px;
   cursor: pointer;
 }
 .srow:last-child {
@@ -247,4 +254,14 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.rowc-open {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  color: inherit;
+  text-decoration: none;
 }

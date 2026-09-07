@@ -12,6 +12,7 @@ use axum::extract::ws::WebSocketUpgrade;
 use futures::StreamExt;
 use prost::Message as _;
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::proto::velobench::{
     AcceptancePoint, ChatRequest, Cluster, ClusterResult, DecodePoint, Delta as DeltaFrame, Done,
@@ -27,8 +28,46 @@ use crate::models::StreamRequest;
 pub struct ParsedDelta {
     pub content: String,
     pub reasoning: String,
+    /// Provider finish reason on the final choice ("stop" | "length" | …).
+    pub finish_reason: Option<String>,
     // (completion, prompt, reasoning_tokens, accepted_prediction_tokens, rejected_prediction_tokens)
     pub usage: Option<(f64, f64, Option<f64>, Option<u64>, Option<u64>)>,
+}
+
+/// A live in-flight run: sockets that re-attach after a page reload subscribe
+/// to the frame broadcast, and get the accumulated text as an instant
+/// snapshot (so the restored chat continues seamlessly). The run also carries
+/// what a reloaded client needs to re-render the user turn — taken from the
+/// request itself, so NO client-side marker (sessionStorage) is required:
+/// any tab of the same session can resume, and a closed-and-reopened tab
+/// works too.
+pub struct LiveRun {
+    /// Session this run belongs to (for GET /api/session inflight discovery).
+    pub session: String,
+    pub request_id: String,
+    /// Every Delta/Stats/Done frame produced by the run.
+    pub tx: tokio::sync::broadcast::Sender<ServerFrame>,
+    /// Accumulated content/reasoning so far (for the resume snapshot).
+    pub buf: std::sync::Mutex<RunBuf>,
+    /// What the client should render for the in-flight user turn.
+    pub info: std::sync::Mutex<LiveRunInfo>,
+}
+
+#[derive(Default)]
+pub struct RunBuf {
+    pub content: String,
+    pub reasoning: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LiveRunInfo {
+    /// 'chat' | 'fill' | 'test' — only chat/fill re-attach to the live stream.
+    pub kind: String,
+    /// Last user message content (placeholder text for fill turns).
+    pub user_content: String,
+    /// Data-URL images attached to the user turn, if any.
+    pub images: Vec<String>,
+    pub fill_tokens: u32,
 }
 
 pub async fn ws_handler(ws: WebSocketUpgrade, State(st): State<AppState>) -> Response {
@@ -58,6 +97,14 @@ async fn run(mut socket: WebSocket, st: AppState) {
         }
     };
     tracing::debug!("ws: request provider={} model={} msgs={}", request.provider_id, request.model, request.messages.len());
+
+    // Resume subscription must be dispatched BEFORE any provider/session
+    // validation: the resume request carries no provider/model — it only
+    // re-attaches this socket to an already-running run.
+    if request.resume && !request.request_id.is_empty() {
+        handle_resume(socket, &st, &request.request_id).await;
+        return;
+    }
 
     let settings = st.store.settings().await;
     let provider = match proxy::require_provider(&settings, &request.provider_id) {
@@ -130,6 +177,27 @@ async fn run(mut socket: WebSocket, st: AppState) {
     let stream_req = to_stream_request(&request);
     let payload = proxy::build_payload(&provider, &request.model, &stream_req, true);
 
+    // Cancellation: the run's request_id maps to a shared flag that the
+    // cancel endpoint (POST /api/cancel/{id}) sets. The stream loop checks it
+    // per chunk, so a Stop stops upstream consumption promptly instead of
+    // waiting for the socket teardown to be noticed.
+    let cancel_flag = if request.request_id.is_empty() {
+        None
+    } else {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        st.cancels
+            .lock()
+            .await
+            .insert(request.request_id.clone(), flag.clone());
+        Some(flag)
+    };
+    let cancelled = || {
+        cancel_flag
+            .as_ref()
+            .map(|f: &Arc<std::sync::atomic::AtomicBool>| f.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    };
+
     // Shared session engine.
     let mut engine = st.stats.lock().await;
     if request.reset_session {
@@ -143,6 +211,10 @@ async fn run(mut socket: WebSocket, st: AppState) {
     }
     engine.set_max_graph_points(settings.max_graph_points);
     engine.set_split_cap(settings.intra_token_latency_split_cap_ms);
+    // Refresh the session-id mirror for GET /api/session: this lock is held
+    // for the whole run, so a client reloading mid-stream reads the mirror
+    // (server.rs get_session) to get the correct turn list.
+    *st.active_session.lock().unwrap() = engine.session_id().to_string();
 
     // Live-stats calibration: seed a per-model estimate→true ratio with a
     // small streaming probe BEFORE the first measured run, then refine it
@@ -172,19 +244,76 @@ async fn run(mut socket: WebSocket, st: AppState) {
 
     engine.begin_run(now_ms());
 
+    // Live-run registration (broadcast frames for resume subscribers). The
+    // user-turn info comes from the request itself so ANY tab of this session
+    // can discover and resume the run after a reload.
+    let live: Option<Arc<LiveRun>> = if request.request_id.is_empty() {
+        None
+    } else {
+        let (tx, _rx) = tokio::sync::broadcast::channel(2048);
+        let last_user = request.messages.iter().rev().find(|m| m.role == "user");
+        let info = LiveRunInfo {
+            kind: if request.kind.is_empty() { "chat".into() } else { request.kind.clone() },
+            user_content: last_user.map(|m| m.content.clone()).unwrap_or_default(),
+            images: last_user.map(|m| m.images.clone()).unwrap_or_default(),
+            fill_tokens: last_user.map(|m| m.fill_tokens).unwrap_or(0),
+        };
+        let state = Arc::new(LiveRun {
+            session: engine.session_id().to_string(),
+            request_id: request.request_id.clone(),
+            tx,
+            buf: std::sync::Mutex::new(RunBuf::default()),
+            info: std::sync::Mutex::new(info),
+        });
+        st.live_runs
+            .lock()
+            .await
+            .insert(request.request_id.clone(), state.clone());
+        Some(state)
+    };
+
     // Proxy + feed.
     let res = match proxy::stream_chat(&st.http, &provider, &payload).await {
         Ok(res) => res,
         Err(e) => {
             tracing::warn!("ws: proxy stream failed: {e}");
             let _ = send_frame(&mut socket, &error_done(e)).await;
+            if !request.request_id.is_empty() {
+                st.live_runs.lock().await.remove(&request.request_id);
+                st.cancels.lock().await.remove(&request.request_id);
+            }
             return;
         }
     };
     tracing::debug!("ws: proxy stream ok (status {})", res.status().as_u16());
     let mut buf = String::new();
     let mut stream = res.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    // Two very different end states must not be conflated (review F2 vs the
+    // persistence the review praised):
+    //   - cancel requested (explicit Stop)  → stop upstream, record CANCELLED.
+    //   - client vanished (reload/nav away) → KEEP consuming upstream to the
+    //     end and record COMPLETE; the user can reload the finished result.
+    let mut was_cancelled = false;
+    let mut client_gone = false;
+    // Cancel must win even when the provider stream STALLS: the flag check
+    // races the chunk read on a short timer, so Stop acknowledges within
+    // ~250 ms instead of hanging until the next chunk (or forever).
+    loop {
+        let next = tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                if cancelled() {
+                    // Acknowledged Stop: drop the upstream response (closing
+                    // the connection tells the provider to stop generating)
+                    // and finalize the turn with its partial output marked
+                    // cancelled.
+                    was_cancelled = true;
+                    break;
+                }
+                continue;
+            }
+            c = stream.next() => c,
+        };
+        let Some(chunk) = next else { break };
         let chunk = match chunk {
             Ok(b) => b,
             Err(e) => {
@@ -208,6 +337,9 @@ async fn run(mut socket: WebSocket, st: AppState) {
                 }
                 let parsed = parse_delta(payload);
                 if let Some(p) = parsed {
+                    if let Some(r) = &p.finish_reason {
+                        engine.set_finish_reason(r);
+                    }
                     // One timestamp per delta, so a content+reasoning pair sharing
                     // a chunk isn't counted as a (false) inter-token gap.
                     let ts = now_ms();
@@ -221,19 +353,42 @@ async fn run(mut socket: WebSocket, st: AppState) {
                         engine.set_usage(Some(c), Some(pr), rt);
                         engine.set_usage_spec(acc, rej);
                     }
-                    let frame = ServerFrame { payload: Some(server_frame::Payload::Delta(DeltaFrame { content: p.content, reasoning: p.reasoning })) };
+                    let frame = ServerFrame { payload: Some(server_frame::Payload::Delta(DeltaFrame { content: p.content.clone(), reasoning: p.reasoning.clone() })) };
+                    let sframe = build_stats_frame(&engine);
+                    // Broadcast to any sockets that resumed this run after a
+                    // reload; the original socket gets a direct copy below.
+                    if let Some(l) = &live {
+                        {
+                            let mut b = l.buf.lock().unwrap();
+                            b.content.push_str(&p.content);
+                            b.reasoning.push_str(&p.reasoning);
+                        }
+                        let _ = l.tx.send(frame.clone());
+                        let _ = l.tx.send(sframe.clone());
+                    }
+                    if client_gone {
+                        continue;
+                    }
                     if send_frame(&mut socket, &frame).await.is_err() {
-                        return;
+                        client_gone = true;
+                        continue;
                     }
                     // Push the latest computed stats immediately (when the server
                     // has it), not on a fixed interval.
-                    let sframe = build_stats_frame(&engine);
                     if send_frame(&mut socket, &sframe).await.is_err() {
-                        return;
+                        client_gone = true;
                     }
                 }
             }
         }
+    }
+    drop(stream);
+    drop(buf);
+    // A vanished socket alone is NOT a cancellation: only an explicit Stop
+    // (cancel flag) marks the turn cancelled.
+    let was_cancelled = cancelled();
+    if client_gone && !was_cancelled {
+        tracing::info!("ws: client vanished mid-stream — generation continues server-side; turn will be recorded complete");
     }
 
     // Finalise.
@@ -340,6 +495,7 @@ async fn run(mut socket: WebSocket, st: AppState) {
             reasoning_tokens: gen.reasoning_tokens,
             meta: build_meta(&gen),
             error: String::new(),
+            cancelled: was_cancelled || cancelled(),
         })),
     };
 
@@ -347,18 +503,76 @@ async fn run(mut socket: WebSocket, st: AppState) {
     // (shared with the concurrent-run workers via record_turn).
     // Final stats snapshot too (so the client has the settled arrays).
     let sframe = build_stats_frame(&engine);
-    let _ = send_frame(&mut socket, &sframe).await;
-    let _ = send_frame(&mut socket, &done).await;
+    if !client_gone {
+        let _ = send_frame(&mut socket, &sframe).await;
+        let _ = send_frame(&mut socket, &done).await;
+    }
+    // Resumed sockets get the final stats + Done over the broadcast.
+    if let Some(l) = &live {
+        let _ = l.tx.send(sframe);
+        let _ = l.tx.send(done);
+    }
     let out = engine.content().to_string();
     let reasoning = engine.reasoning().to_string();
     let category = engine.category().map(|s| s.to_string());
     let session = engine.session_id().to_string();
     drop(engine);
 
-    let bench_id = record_turn(&st, &provider, &request, &stream_req, model_cfg.as_ref(), handle.as_ref(), out, reasoning, category, session, gen).await;
+    let bench_id = record_turn(&st, &provider, &request, &stream_req, model_cfg.as_ref(), handle.as_ref(), out, reasoning, category, session, gen, was_cancelled || cancelled()).await;
     // Deterministic regime labels, off the WS path (background thread).
     if let Some(stored) = st.store.benchmark(&bench_id).await {
         st.store.spawn_stamp(stored);
+    }
+    // The run is settled: drop its cancel flag and live-run registration.
+    if !request.request_id.is_empty() {
+        st.cancels.lock().await.remove(&request.request_id);
+        st.live_runs.lock().await.remove(&request.request_id);
+    }
+}
+
+/// A resume subscription: attach the socket to an in-flight run. The client
+/// first gets a snapshot Delta (everything accumulated so far), then live
+/// frames from the broadcast until the run's Done arrives.
+async fn handle_resume(mut socket: WebSocket, st: &AppState, request_id: &str) {
+    let live = st.live_runs.lock().await.get(request_id).cloned();
+    tracing::info!(request_id = %request_id, live = live.is_some(), "ws: resume subscription requested");
+    let Some(live) = live else {
+        // The run already finished (and was recorded) or is unknown: tell the
+        // client so it falls back to restoring from the record store.
+        let _ = send_frame(&mut socket, &ServerFrame {
+            payload: Some(server_frame::Payload::Done(Done {
+                error: "run-not-active".into(),
+                ..Default::default()
+            })),
+        }).await;
+        return;
+    };
+    let (content, reasoning) = {
+        let b = live.buf.lock().unwrap();
+        (b.content.clone(), b.reasoning.clone())
+    };
+    if !content.is_empty() || !reasoning.is_empty() {
+        let _ = send_frame(&mut socket, &ServerFrame {
+            payload: Some(server_frame::Payload::Delta(DeltaFrame { content, reasoning })),
+        }).await;
+    }
+    let mut rx = live.tx.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(frame) => {
+                let is_done = matches!(&frame.payload, Some(server_frame::Payload::Done(_)));
+                if send_frame(&mut socket, &frame).await.is_err() {
+                    return;
+                }
+                if is_done {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::debug!(skipped = n, "resume subscriber lagged");
+            }
+            Err(_) => return, // run ended without Done (should not happen)
+        }
     }
 }
 
@@ -377,6 +591,7 @@ pub(crate) async fn record_turn(
     category: Option<String>,
     session: String,
     gen: crate::stats::GenStats,
+    cancelled: bool,
 ) -> String {
 let provider_name = provider.name.clone();
 let prompt = request
@@ -444,6 +659,8 @@ let stats = crate::benchmarks::GenStats {
     live_min_tok_s: Some(gen.live_min_tok_s),
     live_max_tok_s: Some(gen.live_max_tok_s),
     live_median_tok_s: Some(gen.live_median_tok_s),
+    finish_reason: gen.finish_reason.clone(),
+    started_at_ms: gen.started_at_ms,
     token_events: gen.token_events.iter().map(|e| crate::benchmarks::TokenEvent {
         t_ms: e.t_ms,
         chars: e.chars,
@@ -453,6 +670,8 @@ let stats = crate::benchmarks::GenStats {
         regime: e.regime.clone(),
     }).collect(),
 };
+    let assertion = judge_assertion(&request.expect, &request.expect_regex, &output);
+
 let bench = crate::benchmarks::Benchmark {
     id: crate::settings::short_id(),
     created_at: chrono::Utc::now().to_rfc3339(),
@@ -475,16 +694,31 @@ let bench = crate::benchmarks::Benchmark {
     // What was actually used for this run (request wins over model config).
     reasoning_enabled: Some(reasoning_on),
     reasoning_effort,
+    status: Some(if cancelled { "cancelled".to_string() } else { "complete".to_string() }),
+    request_id: if request.request_id.is_empty() { None } else { Some(request.request_id.clone()) },
+    // Effective generation budget for this request, when one was set.
+    gen_budget: request
+        .overrides
+        .iter()
+        .find(|o| o.key == "max_tokens")
+        .and_then(|o| o.value.parse::<u64>().ok()),
     prompt,
     reasoning,
     output,
     category,
     segments: Vec::new(),
+    assertion,
     stats,
     usage: Some(usage),
     // Group by the session id (so a page reload can rebuild the conversation),
     // and stash the pre-computed meta line for the rebuilt assistant messages.
-    meta: serde_json::json!({ "line": build_meta(&gen) }),
+    // A cancelled turn is marked right in the line: reopening the chat later
+    // must not present the partial output as an ordinary completed result.
+    meta: serde_json::json!({ "line": if cancelled {
+        format!("{} · CANCELLED", build_meta(&gen))
+    } else {
+        build_meta(&gen)
+    } }),
 };
 
 let bench_id = bench.id.clone();
@@ -878,6 +1112,10 @@ pub fn parse_delta(payload: &str) -> Option<ParsedDelta> {
             reasoning = string_value(r);
         }
     }
+    let finish_reason = choice
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string());
     let usage = v.get("usage").and_then(|u| {
         let completion = u.get("completion_tokens")?.as_f64()?;
         let prompt = u.get("prompt_tokens").and_then(|x| x.as_f64()).unwrap_or(0.0);
@@ -898,7 +1136,7 @@ pub fn parse_delta(payload: &str) -> Option<ParsedDelta> {
         };
         Some((completion, prompt, rt, spec("accepted_prediction_tokens"), spec("rejected_prediction_tokens")))
     });
-    Some(ParsedDelta { content, reasoning, usage })
+    Some(ParsedDelta { content, reasoning, finish_reason, usage })
 }
 
 fn string_value(v: &Value) -> String {
@@ -925,6 +1163,8 @@ fn now_ms() -> f64 {
 }
 
 /// Build the per-turn summary line entirely server-side (nothing computed in JS).
+/// Token counts are labeled explicitly (in/out) — the old "79→556 tok" arrow
+/// notation was unexplained (review A5).
 pub(crate) fn build_meta(gen: &crate::stats::GenStats) -> String {
     let comp = gen.completion_tokens.max(0) as f64;
     let prompt = gen.prompt_tokens.unwrap_or(0.0);
@@ -932,9 +1172,9 @@ pub(crate) fn build_meta(gen: &crate::stats::GenStats) -> String {
     let dec = if decode_s > 0.0 { comp / decode_s } else { 0.0 };
     let mut meta = format!("⚡ {:.1} tok/s decode", dec);
     if gen.prompt_tokens.is_some() {
-        meta.push_str(&format!(" · {}→{} tok", prompt as u64, comp as u64));
+        meta.push_str(&format!(" · in {} · out {} tok", prompt as u64, comp as u64));
     } else {
-        meta.push_str(&format!(" · {} tok", comp as u64));
+        meta.push_str(&format!(" · out {} tok", comp as u64));
     }
     if let Some(ttft) = gen.ttft_ms {
         meta.push_str(&format!(" · TTFT {}", fmt_ms(ttft)));
@@ -950,6 +1190,82 @@ fn fmt_ms(ms: f64) -> String {
     }
 }
 
+
+/// Judge a result assertion on the VISIBLE output (review M1): transport
+/// completion stays separate; correctness is this verdict. Reasoning text is
+/// never part of the answer. Both expectations must hold when both are set.
+pub(crate) fn judge_assertion(
+    expect: &str,
+    expect_regex: &str,
+    output: &str,
+) -> Option<crate::benchmarks::Assertion> {
+    if expect.trim().is_empty() && expect_regex.trim().is_empty() {
+        return None;
+    }
+    let content = output.trim();
+    let pass = {
+        let by_substr = expect.trim().is_empty() || content.contains(expect.trim());
+        let by_regex = if expect_regex.trim().is_empty() {
+            true
+        } else {
+            regex::Regex::new(expect_regex.trim())
+                .map(|re| re.is_match(content))
+                .unwrap_or(false)
+        };
+        by_substr && by_regex
+    };
+    let detail = if pass {
+        String::new()
+    } else if content.is_empty() {
+        "empty output".to_string()
+    } else {
+        format!(
+            "expected {:?}, got {:?} (truncated)",
+            expect.trim(),
+            content.chars().take(60).collect::<String>()
+        )
+    };
+    Some(crate::benchmarks::Assertion {
+        expect: expect.trim().to_string(),
+        expect_regex: expect_regex.trim().to_string(),
+        pass,
+        detail,
+    })
+}
+
+#[test]
+fn assertion_verdicts_match_the_review_examples() {
+    // Substring pass/fail.
+    let a = judge_assertion("4", "", "The answer is 4.").unwrap();
+    assert!(a.pass);
+    let a = judge_assertion("4", "", "The answer is 5.").unwrap();
+    assert!(!a.pass);
+    assert!(a.detail.contains("expected"));
+    // Regex.
+    let a = judge_assertion("", r"^\d+$", "42").unwrap();
+    assert!(a.pass);
+    let a = judge_assertion("", r"^\d+$", "forty-two").unwrap();
+    assert!(!a.pass);
+    // Empty output is a clear non-pass.
+    let a = judge_assertion("OK", "", "").unwrap();
+    assert!(!a.pass);
+    assert_eq!(a.detail, "empty output");
+    // No expectation = no verdict.
+    assert!(judge_assertion("", "", "anything").is_none());
+}
+
+#[test]
+fn sanity_bat_and_ball_regex_accepts_both_phrasings() {
+    // Both phrasings observed live ("5 cents." and "$0.05") pass; the
+    // classic wrong answers fail. No (?i): the FE mirror uses JS RegExp.
+    let re = regex::Regex::new(r"(5\s*[Cc]ents|\$?0\.05\b|5¢)").unwrap();
+    for good in ["5 cents", "5 cents.", "The ball costs 5 cents", "$0.05", "0.05", "5cents"] {
+        assert!(re.is_match(good), "should match {good:?}");
+    }
+    for bad in ["10 cents", "$0.10", "1.00", "1.05", "one dollar"] {
+        assert!(!re.is_match(bad), "should NOT match {bad:?}");
+    }
+}
 
 #[test]
 fn usage_chunk_with_empty_choices_parses() {
@@ -1024,12 +1340,17 @@ mod tests {
             session: "manual-chat".into(),
             section: String::new(),
             regimes_from_sections: false,
+            request_id: "req-test-1".into(),
+            resume: false,
+            expect: "4".into(),
+            expect_regex: String::new(),
         };
         let bytes = req.encode_to_vec();
         let dec = ChatRequest::decode(bytes.as_slice()).unwrap();
         assert_eq!(dec.model_uid, "u123");
         assert_eq!(dec.provider_id, "p1");
         assert_eq!(dec.messages[0].content, "hi");
+        assert_eq!(dec.request_id, "req-test-1");
         assert!(dec.reset_session);
     }
 

@@ -44,7 +44,7 @@
               <div class="muted small tdesc">{{ t.description }}</div>
             }
             <div class="muted small tmeta">
-              {{ sectionCount(t) }} section(s) · {{ t.steps.length - sectionCount(t) }} step(s)
+              {{ sectionCount(t) }} section(s) · {{ t.steps.length - sectionCount(t) }} request(s)
               @if (t.temperature != null) { · temp {{ t.temperature }} }
               @if (t.maxTokens != null) { · max {{ t.maxTokens }} tok }
             </div>
@@ -136,6 +136,11 @@
                 </div>
               } @else if (s.type === 'prompt') {
                 <textarea class="inp" rows="2" [ngModel]="s.text" (ngModelChange)="updateStep($index, { text: $event })" [disabled]="readonly_()" placeholder="Prompt sent to the model as-is"></textarea>
+                <div class="secrow assert-row" title="Result assertions: the run reports PASS/FAIL separately from execution — the expected substring must appear in the VISIBLE answer (reasoning does not count), and/or the regex must match it.">
+                  <span class="muted small">assert</span>
+                  <input class="inp" [ngModel]="s.expect || ''" (ngModelChange)="updateStep($index, { expect: $event })" [disabled]="readonly_()" placeholder="expected substring (optional)" />
+                  <input class="inp" [ngModel]="s.expectRegex || ''" (ngModelChange)="updateStep($index, { expectRegex: $event })" [disabled]="readonly_()" placeholder="expected regex (optional)" />
+                </div>
                 <div class="secrow" title="Per-step reasoning override. 'Inherit' uses the model's configured reasoning; 'off' disables it; a level forces that effort.">
                   <span class="muted small">reasoning</span>
                   <select class="inp" style="max-width: 140px" [ngModel]="s.reasoningEffort || ''" (ngModelChange)="updateStep($index, { reasoningEffort: $event })" [disabled]="readonly_()">

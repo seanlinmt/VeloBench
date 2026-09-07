@@ -73,6 +73,8 @@ export interface ModelConfig {
   reasoning_effort?: string;
   tokenizer?: string;
   live_calibration?: { ratio: number; weight: number; updated_at?: string };
+  /** Last readiness check (review M4); undefined = never checked. */
+  last_check?: { at: string; ok: boolean; error?: string };
 }
 
 export interface ParamOverride {
@@ -296,6 +298,16 @@ export interface TranscriptTurn {
   rejectedPredTokens?: number | null;
   reasoningEnabled?: boolean | null;
   reasoningEffort?: string | null;
+  /** Lifecycle + provenance (review A7/F1: status, truncation, budget,
+   *  request id, and the originating prompt / full answer text). */
+  status?: string | null;
+  finishReason?: string | null;
+  genBudget?: number | null;
+  requestId?: string | null;
+  prompt?: string | null;
+  output?: string | null;
+  /** Result-assertion verdict for this turn (review M1). */
+  assertion?: { expect: string; expectRegex: string; pass: boolean; detail: string } | null;
   /** Test-run bookkeeping (test sessions only). */
   kind?: string;
   label?: string;
@@ -349,6 +361,11 @@ export interface TestStep {
   image?: string;
   /** Image steps: prompt sent with the image. */
   prompt?: string;
+  /** Result assertion (review M1): a substring the visible output must
+   *  contain. Empty = no assertion. */
+  expect?: string;
+  /** Result assertion: a regex the visible output must match. */
+  expectRegex?: string;
   /** Per-step reasoning override: '' inherits the model config, 'off'
    *  disables reasoning, otherwise the effort level (low/medium/high/…). */
   reasoningEffort?: string;

@@ -10,11 +10,17 @@ export interface TestRunState {
   test: TestDef;
   /** Next step index to execute. */
   index: number;
+  /** Executable REQUESTS done / total — sections are markers, not requests
+   *  (review U2: "7/7" was counting section markers as progress). */
+  reqDone: number;
+  reqTotal: number;
   /** Steps fully processed (sections apply instantly, turns after streaming). */
   done: number;
   total: number;
   /** Title of the section currently being executed. */
   section: string;
+  /** The VeloBenchmark session the run records into (for the report link). */
+  session: string;
   running: boolean;
   finished: boolean;
   /** Set when a turn failed upstream: the run stopped; the reason shows in the panel. */
@@ -33,6 +39,18 @@ export interface Msg {
 }
 
 export const MAX_ATTACH = 4;
+
+/** An in-flight run reported BY THE SERVER (GET /api/session `inflight`):
+ *  the request id plus what to render for the user turn. Server-driven, so
+ *  a reload re-attaches from any tab and needs no client-side storage. */
+export interface InflightRun {
+  requestId: string;
+  kind: string;
+  userContent: string;
+  images: string[];
+  fillTokens: number;
+}
+
 
 /**
  * Holds the chat conversation + active stream in a root service so the state
@@ -72,6 +90,12 @@ export class ChatSessionService {
   private doneMeta = '';
   /** Error text of the current turn (Done.error) — '' when the turn is healthy. */
   private turnFailed = '';
+  /** Wire-level id of the in-flight request (cancellation target). */
+  private requestId = '';
+  /** True while a Stop was requested but the server has not confirmed yet. */
+  readonly stopping = signal(false);
+  /** Set when the current turn ended by an acknowledged cancellation. */
+  private turnCancelled = false;
 
   constructor(
     private api: ApiService,
@@ -80,7 +104,9 @@ export class ChatSessionService {
   ) {}
 
   /** Reload the ongoing session from the backend after a page refresh: restores
-   *  the graphs + last-run details and rebuilds the chat from the recorded turns. */
+   *  the graphs + last-run details and rebuilds the chat from the recorded turns.
+   *  If a run was IN FLIGHT during the reload, the chat re-attaches to it and
+   *  streaming continues without interruption (server keeps generating). */
   async restore(): Promise<void> {
     try {
       const s = await this.api.getSession();
@@ -99,12 +125,97 @@ export class ChatSessionService {
           content: t.output || '(stopped — no output)',
           meta: t.meta || '',
           reasoning: t.reasoning || undefined,
+          // Restore the RECORDED reasoning count (same source as the report);
+          // unknown stays undefined — never a fabricated zero (review F5).
+          reasoningTokens: (t as any).reasoning_tokens != null && Number.isFinite(Number((t as any).reasoning_tokens))
+            ? Math.max(0, Math.round(Number((t as any).reasoning_tokens)))
+            : undefined,
         });
+      }
+      // In-flight run continuation across reloads (server-driven): if the run
+      // was recorded meanwhile it is already in the list above; if it is
+      // STILL running server-side, re-render its user turn and re-attach to
+      // the live stream. Works from any tab — the server owns the state.
+      const inflight = (s.inflight ?? null) as InflightRun | null;
+      if (inflight && inflight.requestId) {
+        const recorded = ((s.turns ?? []) as any[]).some((t) => t.request_id === inflight.requestId);
+        if (!recorded && (inflight.kind === 'chat' || inflight.kind === 'fill')) {
+          msgs.push({
+            role: 'user',
+            content: inflight.userContent,
+            images: inflight.images?.length ? inflight.images : undefined,
+            fill: (inflight.fillTokens ?? 0) > 0,
+            fillTokens: (inflight.fillTokens ?? 0) > 0 ? inflight.fillTokens : undefined,
+          });
+          this.messages.set(msgs);
+          this.resumeInflight(inflight);
+          return;
+        }
+        // Recorded already (or a test turn that lands in the records when
+        // done): nothing to re-attach — the list above is the truth.
       }
       this.messages.set(msgs);
     } catch (e) {
       console.warn('restore session', e);
     }
+  }
+
+  /** Re-attach to a run that is still executing server-side: send a resume
+   *  ChatRequest over a fresh socket; the server answers with a snapshot
+   *  Delta (everything so far — appended to the fresh empty accumulators it
+   *  lands exactly right), then live frames until Done. */
+  private resumeInflight(inflight: InflightRun): void {
+    this.streaming.set(true);
+    this.turnFailed = '';
+    this.turnCancelled = false;
+    this.stopping.set(false);
+    this.requestId = inflight.requestId;
+    this.engine.beginTurn();
+    const req = new velobench.ChatRequest({
+      providerId: '', model: '', modelUid: '',
+      messages: [],
+      reasoningEnabled: false,
+      reasoningEffort: '',
+      overrides: [],
+      maxStatsTokens: 0,
+      resetSession: false,
+      resetStats: false,
+      kind: 'chat',
+      label: '',
+      section: '',
+      regimesFromSections: false,
+      session: 'manual-chat',
+      requestId: inflight.requestId,
+      resume: true,
+    });
+    const bytes = velobench.ChatRequest.encode(req).finish();
+    const ws = this.openWs();
+    this.ws = ws;
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => { try { ws.send(bytes); } catch { /* ignore */ } };
+    ws.onmessage = (ev) => {
+      if (this.ws !== ws) return;
+      try {
+        const frame = velobench.ServerFrame.decode(new Uint8Array(ev.data as ArrayBuffer));
+        if (frame.done && frame.done.error === 'run-not-active') {
+          // The run finished between the record check and the resume:
+          // rebuild from the records (the turn is there now).
+          this.ws = undefined;
+          this.detach(ws);
+          this.streaming.set(false);
+          void this.restore();
+          return;
+        }
+        void this.handleFrame(frame);
+      } catch (e) {
+        console.warn('ws frame decode', e);
+      }
+    };
+    ws.onerror = () => { /* onclose handles finalise */ };
+    ws.onclose = () => {
+      if (this.ws !== ws) return;
+      if (this.streaming()) void this.finalizeRun();
+    };
   }
 
   async send(): Promise<void> {
@@ -157,15 +268,17 @@ export class ChatSessionService {
    *  The backend session is reset immediately so a page reload restores nothing,
    *  and the socket is detached so late frames cannot repopulate the UI. */
   async newChat(): Promise<void> {
+    // Tell the server to stop an in-flight generation BEFORE detaching: the
+    // socket death alone would only be noticed on the next frame-send.
+    if (this.ws && this.requestId) {
+      const rid = this.requestId;
+      try { await this.api.cancelRequest(rid); } catch { /* ignore */ }
+    }
     // Detach first: an in-flight stream must not write any more state.
     if (this.ws) {
       const ws = this.ws;
       this.ws = undefined;
-      ws.onmessage = null;
-      ws.onclose = null;
-      ws.onerror = null;
-      ws.onopen = null;
-      try { ws.close(); } catch { /* ignore */ }
+      this.detach(ws);
     }
     // Clear the visible state synchronously so the screen clears at once.
     this.messages.set([]);
@@ -178,6 +291,7 @@ export class ChatSessionService {
     this.accContent = '';
     this.accReasoning = '';
     this.doneMeta = '';
+    this.requestId = '';
     this.engine.resetSession();
     // Start a new server session now (not lazily on the next turn). Old turns
     // stay saved under the previous session id.
@@ -199,10 +313,17 @@ export class ChatSessionService {
       resetStats?: boolean;
       regimes?: boolean;
       reasoning?: { enabled: boolean; effort: string };
+      expect?: string;
+      expectRegex?: string;
     },
   ): void {
     this.streaming.set(true);
     this.turnFailed = '';
+    this.turnCancelled = false;
+    this.stopping.set(false);
+    // Unique id for THIS run: the target for an acknowledged Stop (the server
+    // maps it to a cancel flag) and the reference on the recorded benchmark.
+    this.requestId = (crypto?.randomUUID?.() ?? `req-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     // New turn: the previous turn's final stats must not keep the live panel
     // in COMPLETE while this turn streams — behave exactly like turn 1.
     this.engine.beginTurn();
@@ -236,6 +357,9 @@ export class ChatSessionService {
       section: opts?.section ?? '',
       regimesFromSections: !!opts?.regimes,
       session: 'manual-chat',
+      requestId: this.requestId,
+      expect: opts?.expect ?? '',
+      expectRegex: opts?.expectRegex ?? '',
     });
     this.pendingReset = false;
     const bytes = velobench.ChatRequest.encode(req).finish();
@@ -305,6 +429,10 @@ export class ChatSessionService {
         this.accContent = this.turnFailed;
         this.engine.setContent(this.accContent);
       }
+      if (frame.done.cancelled) {
+        // The server acknowledged the Stop: the partial output is final.
+        this.turnCancelled = true;
+      }
       this.engine.applyDone(frame.done);
       this.doneMeta = frame.done.meta || (this.turnFailed ? 'failed' : '');
       await this.finalizeRun();
@@ -316,15 +444,22 @@ export class ChatSessionService {
     const content = this.engine.content;
     const reasoning = this.engine.reasoning;
     const reasoningTokens = Math.round(this.engine.final()?.reasoning_tokens ?? 0);
+    const cancelled = this.turnCancelled;
     this.streaming.set(false);
+    this.stopping.set(false);
+    this.turnCancelled = false;
+    this.requestId = '';
+    const meta = cancelled
+      ? [this.doneMeta, 'CANCELLED'].filter(Boolean).join(' · ')
+      : this.doneMeta;
     this.streamContent.set(content);
     this.streamReasoning.set(reasoning);
     this.messages.update((m) => [
       ...m,
       {
         role: 'assistant',
-        content: content || '(stopped — no output)',
-        meta: this.doneMeta,
+        content: content || (cancelled ? '(cancelled — no output)' : '(stopped — no output)'),
+        meta,
         reasoning: reasoning || undefined,
         reasoningTokens: reasoningTokens > 0 ? reasoningTokens : undefined,
       },
@@ -338,22 +473,58 @@ export class ChatSessionService {
     // The server records the benchmark itself (all record-keeping in Rust).
   }
 
+  /** Detach all handlers and close a socket without touching run state. */
+  private detach(ws: WebSocket): void {
+    ws.onmessage = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onopen = null;
+    try { ws.close(); } catch { /* ignore */ }
+  }
+
+  /** Stop the in-flight turn. This is now an end-to-end cancellation: the
+   *  server is told to stop consuming the upstream stream (POST
+   *  /api/cancel/{request_id}), and the turn finalizes from the server's
+   *  cancelled Done frame with its partial output preserved and marked.
+   *  A fallback timer detaches locally if no confirmation ever arrives. */
   stop(): void {
-    // Detach + finalize IMMEDIATELY. Relying on the socket's close event
-    // leaves the UI in streaming state until the server answers the closing
-    // handshake — which it only does after noticing the dead pipe on its next
-    // frame-send, so the Stop button could hang for a very long time even
-    // though generation has stopped.
-    if (this.ws) {
-      const ws = this.ws;
+    const ws = this.ws;
+    if (!ws) return;
+    const rid = this.requestId;
+    if (!rid) {
+      // Legacy turn without a request id: old behavior (detach + finalize).
       this.ws = undefined;
-      ws.onmessage = null;
-      ws.onclose = null;
-      ws.onerror = null;
-      ws.onopen = null;
-      try { ws.close(); } catch { /* ignore */ }
+      this.detach(ws);
+      void this.finalizeRun();
+      return;
     }
-    void this.finalizeRun();
+    // Keep the socket + handlers attached so the cancelled Done frame can
+    // finalize the turn; show "stopping" until then.
+    this.stopping.set(true);
+    this.api.cancelRequest(rid).then((r) => {
+      if (r && r.known === false && this.ws === ws) {
+        // Unknown request (already finished, or an older server): finalize
+        // from what we have.
+        this.ws = undefined;
+        this.detach(ws);
+        void this.finalizeRun();
+      }
+    }).catch(() => {
+      if (this.ws === ws) {
+        this.ws = undefined;
+        this.detach(ws);
+        void this.finalizeRun();
+      }
+    });
+    // Grace period: if the server never confirms (pathological finalization),
+    // release the composer anyway — detached sockets finalize locally.
+    setTimeout(() => {
+      if (this.ws === ws && this.streaming()) {
+        this.ws = undefined;
+        this.detach(ws);
+        void this.finalizeRun();
+      }
+    }, 8000);
   }
 
   // ---------- Test Constructor runner ----------
@@ -393,7 +564,11 @@ export class ChatSessionService {
       return false;
     }
     // One fresh VeloBenchmark session for the WHOLE run (all turns share its id).
-    try { await this.api.newSession(); } catch { /* ignore */ }
+    let sessionId = '';
+    try {
+      const res: any = await this.api.newSession();
+      sessionId = String(res?.session_id || '');
+    } catch { /* ignore */ }
     this.messages.set([]);
     this.streamContent.set('');
     this.streamReasoning.set('');
@@ -407,7 +582,10 @@ export class ChatSessionService {
       index: 1,
       done: 1, // the leading section applies instantly
       total: test.steps.length,
+      reqDone: 0,
+      reqTotal: test.steps.filter((st) => st.type !== 'section').length,
       section: first?.title || 'Section 1',
+      session: sessionId,
       running: true,
       finished: false,
     });
@@ -527,6 +705,10 @@ export class ChatSessionService {
           reset: false,
           resetStats,
           regimes: !!st.test.regimesFromSections,
+          // Result assertions (review M1): judged server-side on the
+          // visible output; the verdict lands on the recorded turn.
+          expect: (step as any).expect || '',
+          expectRegex: (step as any).expectRegex || (step as any).expect_regex || '',
         },
       );
       // Wait for the turn's done frame (or a stop).
@@ -542,7 +724,7 @@ export class ChatSessionService {
         this.turnFailed = '';
         return;
       }
-      this.testRun.set({ ...after, done: after.done + 1, index: after.index + 1 });
+      this.testRun.set({ ...after, done: after.done + 1, reqDone: after.reqDone + 1, index: after.index + 1 });
     }
   }
 
@@ -554,16 +736,17 @@ export class ChatSessionService {
     // UI state first so every Stop control reverts instantly; the (slow)
     // server-side cleanup below must not keep the button visible.
     this.testRun.set(null);
+    if (this.ws && this.requestId) {
+      const rid = this.requestId;
+      try { await this.api.cancelRequest(rid); } catch { /* ignore */ }
+    }
     if (this.ws) {
       const ws = this.ws;
       this.ws = undefined;
-      ws.onmessage = null;
-      ws.onclose = null;
-      ws.onerror = null;
-      ws.onopen = null;
-      try { ws.close(); } catch { /* ignore */ }
+      this.detach(ws);
     }
     this.streaming.set(false);
+    this.requestId = '';
     this.messages.set([]);
     this.streamContent.set('');
     this.streamReasoning.set('');

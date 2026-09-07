@@ -35,6 +35,19 @@
       </div>
     </header>
 
+    @if (compat().length) {
+      <div class="compat card" role="note" aria-label="Comparison compatibility notes">
+        <div class="compat-head">Before reading a winner — compatibility</div>
+        @for (n of compat(); track n.text) {
+          <div class="compat-line" [class.warn]="n.level === 'warn'">
+            @if (n.level === 'warn') {<span class="compat-ico" aria-hidden="true">⚠</span>}
+            @else {<span class="compat-ico" aria-hidden="true">ℹ</span>}
+            {{ n.text }}
+          </div>
+        }
+      </div>
+    }
+
     <div class="chart-card card">
       <div class="chart-head"><h3>Head-to-head metrics</h3><span class="chart-unit">B relative to A · green = B better</span></div>
       <table class="tbl">
@@ -47,7 +60,7 @@
               <td class="l">{{ r.metric }}<span class="unit"> {{ r.unit }}</span></td>
               <td class="r mono" [class.good]="r.good === false" [class.bad]="r.good === true">{{ r.aS }}</td>
               <td class="r mono strong" [class.good]="r.good === true" [class.bad]="r.good === false">{{ r.bS }}</td>
-              <td class="r mono">{{ r.d }}</td>
+              <td class="r mono">{{ r.d }}@if (r.good === true) {<span class="dir win" title="B is better on this metric">B better</span>} @else if (r.good === false) {<span class="dir loss" title="B is worse on this metric">B worse</span>}</td>
               <td class="r mono" [class.good]="r.good === true" [class.bad]="r.good === false">{{ r.pct }}</td>
             </tr>
           }

@@ -112,6 +112,17 @@ pub struct Provider {
     pub models: Vec<ModelConfig>,
 }
 
+/// Result of a one-shot model readiness check (review M4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCheck {
+    /// ISO-8601 when the check ran.
+    pub at: String,
+    pub ok: bool,
+    /// Failure reason (auth, billing, unknown model, network …).
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub id: String,
@@ -122,6 +133,11 @@ pub struct ModelConfig {
     /// Optional user label to tell duplicates apart ("fast", "creative", ...).
     #[serde(default)]
     pub label: Option<String>,
+    /// Last readiness check (review M4): a tiny live request verified the
+    /// entry works. None = never checked (do not infer readiness from being
+    /// listed).
+    #[serde(default)]
+    pub last_check: Option<ModelCheck>,
     /// Arbitrary "key: value" inference parameters (repetition_penalty,
     /// temperature, top_k, min_p, seed, ...). Decided server-side on send.
     #[serde(default)]

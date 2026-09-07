@@ -1,6 +1,6 @@
 import { Component, OnInit, computed, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { Router } from '@angular/router';
+import { Router, RouterLink } from '@angular/router';
 import { ApiService } from '../../services/api.service';
 import { SessionGroup } from '../../types';
 
@@ -18,7 +18,7 @@ const PAGE_SIZE = 8;
 @Component({
   selector: 'app-comparisons',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, RouterLink],
   templateUrl: './comparisons.component.html',
   styleUrl: './comparisons.component.css',
 })
@@ -60,6 +60,10 @@ export class ComparisonsComponent implements OnInit {
     void this.refresh();
   }
 
+  /** False until the first fetch resolves — a half-loaded page must not
+   *  claim "no saved comparisons" (review F7). */
+  loaded = signal(false);
+
   async refresh(): Promise<void> {
     try {
       const [comps, benches, meta] = await Promise.all([
@@ -91,8 +95,10 @@ export class ComparisonsComponent implements OnInit {
       }
       this.groups.set([...map.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
       this.clampPages();
+      this.loaded.set(true);
     } catch (e: any) {
       this.error.set(String(e?.message || e));
+      this.loaded.set(true);
     }
   }
 

@@ -120,11 +120,67 @@ export class CompareComponent implements OnInit {
       this.subB.set(subOf(B));
       this.a.set(sideStats(String(c.a), this.titleA(), A.turns || [], A.created_at));
       this.b.set(sideStats(String(c.b), this.titleB(), B.turns || [], B.created_at));
+      this.buildCompat(A.turns || [], B.turns || []);
       this.buildRows();
       setTimeout(() => this.drawCharts());
     } catch (e: any) {
       this.error.set(String(e?.message || e));
     }
+  }
+
+  /** Compatibility notes (review M3): matching names alone do not make two
+   *  sessions comparable. Facts first — differences that undermine the
+   *  comparison warn; expected differences (the model under test) inform. */
+  readonly compat = signal<Array<{ level: 'warn' | 'info'; text: string }>>([]);
+
+  private buildCompat(at: any[], bt: any[]): void {
+    const out: Array<{ level: 'warn' | 'info'; text: string }> = [];
+    if (!at.length || !bt.length) return;
+    const pick = (arr: any[], f: (t: any) => any) => [...new Set(arr.map(f).filter((v) => v != null && v !== ''))];
+    const workersOf = (arr: any[]) => new Set(arr.map((t) => String(t.section || '')).filter((x) => /^worker \d+$/.test(x))).size;
+    const awc = workersOf(at);
+    const bwc = workersOf(bt);
+    const aModels = pick(at, (t) => t.model);
+    const bModels = pick(bt, (t) => t.model);
+    const aTests = pick(at, (t) => String(t.label || '').split(' · ')[0]);
+    const bTests = pick(bt, (t) => String(t.label || '').split(' · ')[0]);
+    // workload identity
+    if (aTests.join(',') !== bTests.join(',')) {
+      out.push({ level: 'warn', text: `Different workload${aTests.length || bTests.length ? `: ${aTests.join(' + ') || '—'} vs ${bTests.join(' + ') || '—'}` : ''} — throughput/latency deltas may reflect the prompts, not the systems.` });
+    }
+    // worker count
+    if ((awc > 0 || bwc > 0) && awc !== bwc) {
+      out.push({ level: 'warn', text: `Different concurrency: ${awc || 'single'} vs ${bwc || 'single'} worker(s) — aggregate figures are not comparable across worker counts.` });
+    }
+    // model under test
+    if (aModels.join(',') !== bModels.join(',')) {
+      out.push({ level: 'info', text: `Different model${aModels.length > 1 || bModels.length > 1 ? 's' : ''}: ${aModels.join(', ') || '—'} vs ${bModels.join(', ') || '—'} (expected for model comparisons).` });
+    }
+    // per-step budgets on shared step labels
+    const budgetOf = (arr: any[]) => {
+      const m = new Map<string, number>();
+      for (const t of arr) {
+        const key = String(t.label || '');
+        if (key && t.genBudget != null && !m.has(key)) m.set(key, t.genBudget);
+      }
+      return m;
+    };
+    const ab = budgetOf(at);
+    const bb = budgetOf(bt);
+    const budgetDiffs: string[] = [];
+    for (const [k, v] of ab) {
+      if (bb.has(k) && bb.get(k) !== v) budgetDiffs.push(`"${k.slice(-24)}" ${v} vs ${bb.get(k)} tok`);
+    }
+    if (budgetDiffs.length) {
+      out.push({ level: 'warn', text: `Different generation budgets on shared steps — ${budgetDiffs.slice(0, 3).join('; ')}${budgetDiffs.length > 3 ? ' …' : ''}.` });
+    }
+    // tokenizer source
+    const ats = pick(at, (t) => t.tokenSource);
+    const bts = pick(bt, (t) => t.tokenSource);
+    if (ats.join(',') !== bts.join(',')) {
+      out.push({ level: 'info', text: `Token counting differs: ${ats.join(', ') || 'estimated'} vs ${bts.join(', ') || 'estimated'} — token-derived metrics carry that uncertainty.` });
+    }
+    this.compat.set(out);
   }
 
   fmtRate(v: number): string {
@@ -147,8 +203,11 @@ export class CompareComponent implements OnInit {
         b: bv,
         aS: fmt(av),
         bS: fmt(bv),
-        d: (d >= 0 ? '+' : '') + fmt(Math.abs(d)),
-        pct: (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%',
+        // Delta = B − A with its sign retained (review A4): decreases must
+        // render with a minus, increases with a plus. Rounding only for
+        // display; direction-of-improvement is a separate field (good).
+        d: (d >= 0 ? '+' : '-') + fmt(Math.abs(d)),
+        pct: (pct >= 0 ? '+' : '-') + Math.abs(pct).toFixed(1) + '%',
         fmt,
         good: higherBetter === null ? null : Math.abs(d) < 1e-9 ? null : higherBetter ? d > 0 : d < 0,
       };

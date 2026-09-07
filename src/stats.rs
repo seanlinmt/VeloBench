@@ -72,6 +72,12 @@ pub struct GenStats {
     /// TTFT as first-event arrival, before the first-chunk batching
     /// correction. `ttft_ms` holds the corrected value.
     pub ttft_ms_measured: Option<f64>,
+    /// Provider finish reason ("stop" | "length" | …) when the stream
+    /// reported one. "length" = output truncated by the generation budget.
+    pub finish_reason: Option<String>,
+    /// Absolute epoch-ms of the request start — the true t=0 that the
+    /// token-event timeline is relative to.
+    pub started_at_ms: Option<f64>,
 }
 
 impl GenStats {
@@ -156,6 +162,10 @@ pub struct StatsEngine {
     // (OpenAI-style usage.accepted_prediction_tokens / rejected_prediction_tokens)
     usage_accepted: Option<u64>,
     usage_rejected: Option<u64>,
+    /// Last provider finish reason seen on this run ("stop"/"length"/…).
+    finish_reason: Option<String>,
+    /// Absolute epoch-ms of begin_run — the run timeline's true t=0.
+    started_at_ms: Option<f64>,
 
     // session-scoped
     session_points: Vec<SessionPoint>,
@@ -206,6 +216,8 @@ impl StatsEngine {
             usage_reasoning_tokens: None,
             usage_accepted: None,
             usage_rejected: None,
+            finish_reason: None,
+            started_at_ms: None,
             session_points: Vec::new(),
             max_graph_points: 10000,
             acceptance_raw: Vec::new(),
@@ -403,6 +415,16 @@ impl StatsEngine {
         self.usage_reasoning_tokens = None;
         self.usage_accepted = None;
         self.usage_rejected = None;
+        self.finish_reason = None;
+        self.started_at_ms = Some(now_ms);
+    }
+
+    /// Provider finish reason for the current run ("stop"/"length"/…), taken
+    /// from the last delta that carried one.
+    pub fn set_finish_reason(&mut self, reason: &str) {
+        if !reason.is_empty() {
+            self.finish_reason = Some(reason.to_string());
+        }
     }
 
     /// Per-model live-token calibration (true tokens per estimate unit).
@@ -669,6 +691,8 @@ impl StatsEngine {
                 .collect(),
             usage_completion: self.usage_completion,
             est_tokens_raw: est_total,
+            finish_reason: self.finish_reason.clone(),
+            started_at_ms: self.started_at_ms,
         };
 
         self.live.tok_s = final_tok_s;

@@ -1110,10 +1110,30 @@ pub async fn session_detail(st: &AppState, session: &str) -> Option<serde_json::
                 "kind": r.kind,
                 "label": r.label,
                 "section": r.section,
+                // The originating user prompt + full answer text, so the
+                // transcript can show what was actually sent and answered
+                // (review A7: the reviewed transcript hid the prompt).
+                "prompt": r.prompt,
+                "output": r.output,
                 "regimesFromSections": r.regimes_from_sections,
                 "ttftMs": r.stats.ttft_ms,
                 "completionTokens": r.stats.completion_tokens,
                 "finalTokS": r.stats.final_tok_s,
+                // Lifecycle + provenance for the report: cancelled turns,
+                // truncation, effective budget and true request start time.
+                "status": r.status,
+                "finishReason": r.stats.finish_reason,
+                // Result-assertion verdict (review M1): correctness is
+                // reported separately from transport completion.
+                "assertion": r.assertion.as_ref().map(|a| serde_json::json!({
+                    "expect": a.expect,
+                    "expectRegex": a.expect_regex,
+                    "pass": a.pass,
+                    "detail": a.detail,
+                })),
+                "genBudget": r.gen_budget,
+                "requestId": r.request_id,
+                "startedAtMs": r.stats.started_at_ms,
                 // Live rate stats for the per-turn table columns.
                 "liveMedianTokS": r.stats.live_median_tok_s,
                 "liveMinTokS": r.stats.live_min_tok_s,
@@ -1186,6 +1206,10 @@ mod tests {
             session: "s".into(),
             reasoning_enabled: None,
             reasoning_effort: None,
+            status: None,
+            request_id: None,
+            gen_budget: None,
+            assertion: None,
             prompt: String::new(),
             reasoning: String::new(),
             output: String::new(),
@@ -1204,6 +1228,8 @@ mod tests {
                 live_min_tok_s: None,
                 live_max_tok_s: None,
                 live_median_tok_s: None,
+                finish_reason: None,
+                started_at_ms: None,
                 token_events: events
                     .into_iter()
                     .map(|(kind, text)| TokenEvent {

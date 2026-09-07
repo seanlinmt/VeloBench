@@ -34,8 +34,9 @@
       <div class="dl-stack">
         <div class="dl-row"><span class="dl-k">median</span><span class="dl-v mono">{{ live().median.toFixed(1) }}</span></div>
         <div class="dl-row"><span class="dl-k">range</span><span class="dl-v mono">{{ live().min.toFixed(1) }}–{{ live().max.toFixed(1) }}</span></div>
-        <div class="dl-row"><span class="dl-k">stability</span><span class="dl-v mono">{{ stabilityPct() }}</span></div>
+        <div class="dl-row" title="median ÷ peak of the windowed rate series — a pacing indicator; the report's 'sustained vs peak' uses a different formula (tail median vs p95)"><span class="dl-k">pacing (med/peak)</span><span class="dl-v mono">{{ stabilityPct() }}</span></div>
       </div>
+      <div class="dl-prov muted" title="While streaming, token counts and rates are calibrated live estimates; when the run completes they snap to the provider's usage report (or exact tokenizer counts).">{{ runState() === 'COMPLETE' ? 'final · reconciled with provider usage' : 'live estimate · reconciled at finish' }}</div>
     </div>
     <div class="dl-col">
       <div class="dl-side">
@@ -46,7 +47,7 @@
       <div class="dl-side">
         <div class="eyebrow">Progress</div>
         <div class="big"><span class="num">{{ live().tokens.toFixed(0) }}</span><span class="unit">tok</span></div>
-        <div class="dl-sub muted mono">{{ live().tokens.toFixed(0) }} tok/resp · {{ fmtDur(live().gen_ms) }} elapsed</div>
+        <div class="dl-sub muted mono">{{ live().tokens.toFixed(0) }} tok this response · {{ fmtDur(live().gen_ms) }} elapsed</div>
       </div>
     </div>
   </div>

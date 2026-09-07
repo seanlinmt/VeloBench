@@ -115,7 +115,90 @@ nav {
 .tel-ind .dot { width: 9px; height: 9px; border-radius: 50%; background: #35d07f; box-shadow: 0 0 7px #35d07f77; }
 .tel-ind.conn { border-color: #35d07f66; color: #35d07f; }
 
-/* Telemetry receiver indicator (topbar) */
-.tel-ind { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border: 1px solid var(--border, #2a3346); border-radius: 999px; font-size: 11px; color: var(--text-muted, #96a1b5); }
-.tel-ind .dot { width: 9px; height: 9px; border-radius: 50%; background: #35d07f; box-shadow: 0 0 7px #35d07f77; }
-.tel-ind.conn { border-color: #35d07f66; color: #35d07f; }
+/* Hamburger — hidden on desktop, the only nav opener on phones. */
+.nav-toggle {
+  display: none;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  width: 38px;
+  height: 34px;
+  padding: 0 8px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.nav-toggle span {
+  display: block;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--text);
+}
+.nav-backdrop { display: none; }
+
+/* ---- Tablet: genuine compact icon rail — the rail no longer pretends to
+   be a desktop column, but stays visible (no extra tap to navigate). ---- */
+@media (max-width: 1100px) {
+  .sidebar { width: 56px; padding: 12px 6px; }
+  .sidebar .label, .sidebar .logo span, .topbar .provider { display: none; }
+  .logo { justify-content: center; padding: 4px 0 14px; }
+  .nav-item { justify-content: center; padding: 10px 0; }
+  .nav-item .icon { width: auto; }
+  .status { justify-content: center; padding: 6px 0; }
+  .status-text { display: none; }
+  .config-select.inp { max-width: 220px; }
+}
+
+/* ---- Phone: off-canvas drawer. The sidebar reserves NO width; opening
+   navigation is an explicit tap on the hamburger. ---- */
+@media (max-width: 700px) {
+  .sidebar {
+    position: fixed;
+    top: 0; left: 0; bottom: 0;
+    z-index: 60;
+    width: 216px;
+    padding: 14px 10px;
+    transform: translateX(-104%);
+    transition: transform .18s ease;
+    box-shadow: 0 0 40px rgba(0,0,0,.5);
+  }
+  .app.nav-open .sidebar { transform: translateX(0); }
+  .sidebar .label, .sidebar .logo span, .status-text { display: block; }
+  .logo { justify-content: flex-start; padding: 6px 8px 16px; }
+  .nav-item { justify-content: flex-start; padding: 10px 12px; }
+  .nav-item .icon { width: 20px; }
+  .status { justify-content: flex-start; padding: 6px 8px; }
+  .nav-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    background: rgba(4, 8, 15, .55);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .18s ease;
+  }
+  .app.nav-open .nav-backdrop { opacity: 1; pointer-events: auto; }
+  .nav-toggle { display: flex; }
+
+  /* Topbar: wrap into two rows, controls keep reachable sizes. */
+  .topbar { flex-wrap: wrap; padding: 8px 12px; row-gap: 8px; }
+  .config-select.inp { max-width: none; flex: 1 1 140px; min-width: 0; }
+  .fav-select { max-width: none; flex: 1 1 120px; min-width: 0; }
+}
+
+/* Visible scope label on the topbar model selector (review U4): the picker
+   only affects the NEXT run — reports are immutable records. */
+.next-run-label {
+  font-size: 10px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  opacity: .8;
+  white-space: nowrap;
+}
+@media (max-width: 1100px) {
+  .next-run-label { display: none; }
+}

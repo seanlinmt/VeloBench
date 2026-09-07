@@ -85,8 +85,8 @@ h2 { margin: 0; font-size: 20px; }
 /* Secondary header: holds every report control. Never part of the report
    body, never captured. */
 .report-controls {
-  display: flex; align-items: center; gap: 8px 20px; flex-wrap: wrap;
-  padding: 8px 12px; margin-bottom: 16px;
+  display: flex; align-items: center; gap: 6px 12px; flex-wrap: wrap;
+  padding: 6px 12px; margin-bottom: 16px;
   background: linear-gradient(180deg, var(--surface-2), var(--surface-1));
   border: 1px solid var(--border-c); border-radius: var(--radius-card);
   position: sticky; top: 0; z-index: 20;
@@ -99,6 +99,22 @@ h2 { margin: 0; font-size: 20px; }
 }
 .report-controls .tabs { margin-bottom: 0; }
 .analytics.capturing .report-controls { display: none; }
+
+/* Review R3: every finding jump must land with its heading + chart BELOW the
+   sticky toolbar, never hidden underneath it. */
+[id^="sec-"] { scroll-margin-top: 76px; }
+
+/* The sticky bar must not eat half the viewport at 1280px or below:
+   tighter groups and smaller paddings keep it to one or two slim rows. */
+@media (max-width: 1360px) {
+  .report-controls { gap: 5px 10px; padding: 5px 10px; }
+  .report-controls .btn { padding: 5px 10px; font-size: 12px; }
+  .report-controls .rc-label { display: none; }
+}
+@media (max-width: 700px) {
+  [id^="sec-"] { scroll-margin-top: 96px; }
+  .report-controls { position: static; }
+}
 
 /* ===== §3.2 VeloStrip ===== */
 .velostrip { margin-bottom: 14px; }
@@ -552,3 +568,93 @@ table.bins td.num, table.bins th.num { text-align: right; font-family: ui-monosp
   border-bottom: 1px solid rgba(129, 140, 248, 0.45);
 }
 .agg-row td:first-child { font-size: 12.5px; }
+
+/* Per-request status flags in the concurrent step tables (review F1/A2):
+   make invalid or unmeasurable results visible instead of presenting them
+   as ordinary numbers. */
+.turnflag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+.turnflag.bad {
+  background: rgba(228, 99, 107, 0.18);
+  color: #f87171;
+  border: 1px solid rgba(228, 99, 107, 0.5);
+}
+.turnflag.warn {
+  background: rgba(246, 200, 76, 0.14);
+  color: #fbbf24;
+  border: 1px solid rgba(246, 200, 76, 0.45);
+}
+.turnflag.dim {
+  background: rgba(125, 125, 155, 0.14);
+  color: #96a1b5;
+  border: 1px solid rgba(125, 125, 155, 0.4);
+}
+
+/* ---- Export feedback + transcript extras (review A7/A8/M5) ---- */
+.export-note {
+  margin: -8px 0 14px;
+  padding: 7px 12px;
+  border: 1px solid var(--border-c);
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.tr-toggle { margin-left: auto; display: inline-flex; gap: 6px; }
+.turn-head { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px; }
+.turn-flags { display: inline-flex; gap: 6px; }
+.turn-settings { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 6px 0 4px; color: var(--text-faint); font-size: 10.5px; }
+.turn-prompt summary { cursor: pointer; margin: 4px 0; }
+.turn-prompt pre {
+  margin: 4px 0 8px;
+  padding: 8px 10px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-c);
+  border-radius: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.raw-text {
+  margin: 6px 0 0;
+  padding: 10px 12px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-c);
+  border-radius: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text);
+}
+
+/* Result-assertion verdicts (review M1). */
+.turnflag.ok {
+  background: rgba(63, 182, 139, 0.16);
+  color: #57d9a3;
+  border: 1px solid rgba(63, 182, 139, 0.5);
+}
+.turn-assert {
+  margin: 4px 0;
+  padding: 4px 8px;
+  border-radius: 7px;
+  font-size: 11px;
+  background: rgba(63, 182, 139, 0.1);
+  color: #57d9a3;
+  border: 1px solid rgba(63, 182, 139, 0.35);
+}
+.turn-assert.fail {
+  background: rgba(228, 99, 107, 0.12);
+  color: #f87171;
+  border-color: rgba(228, 99, 107, 0.4);
+}

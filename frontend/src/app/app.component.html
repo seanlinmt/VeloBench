@@ -1,17 +1,20 @@
-<div class="app">
-  <aside class="sidebar">
+<div class="app" [class.nav-open]="navOpen()">
+  <div class="nav-backdrop" (click)="closeNav()"></div>
+  <aside class="sidebar" [class.open]="navOpen()">
     <div class="logo"><img src="/favicon-96x96.png" alt="VeloBenchmark logo" /><span>VeloBenchmark</span></div>
     <nav>
       @for (item of nav; track item.path) {
-        <a [routerLink]="item.path" routerLinkActive="active" class="nav-item">
-          <span class="icon">{{ item.icon }}</span>
+        <a [routerLink]="item.path" routerLinkActive="active" class="nav-item" (click)="closeNav()"
+           [attr.aria-label]="item.label" [attr.aria-current]="isActive(item.path) ? 'page' : null"
+           [title]="item.label">
+          <span class="icon" aria-hidden="true">{{ item.icon }}</span>
           <span class="label">{{ item.label }}</span>
         </a>
       }
     </nav>
     <div class="sidebar-foot">
-      <div class="status">
-        <span class="dot" [class.up]="!!settingsService.activeProvider()"></span>
+      <div class="status" role="status" [attr.aria-label]="'Server status: ' + active()">
+        <span class="dot" aria-hidden="true" [class.up]="!!settingsService.activeProvider()"></span>
         <span class="status-text">{{ active() }}</span>
       </div>
     </div>
@@ -19,9 +22,14 @@
 
   <section class="main">
     <header class="topbar">
+      <button class="nav-toggle" (click)="toggleNav()" aria-label="Toggle navigation"
+              [attr.aria-expanded]="navOpen()" title="Navigation">
+        <span></span><span></span><span></span>
+      </button>
       <div class="provider">{{ providerName() }}</div>
       @if (configs().length) {
-        <select #configSelect class="config-select inp" [value]="currentConfigKey()" (change)="onConfigChange($event)" title="Model + provider config">
+        <span class="next-run-label" title="The selected model is used for the NEXT run only — recorded reports keep the model they were generated with">model for next run</span>
+        <select #configSelect class="config-select inp" [value]="currentConfigKey()" (change)="onConfigChange($event)" title="Model for next run — provider + model config">
           @for (c of configs(); track c.key) {
             <option [value]="c.key">{{ c.label }}</option>
           }
@@ -29,32 +37,26 @@
       } @else {
         <div class="model">{{ active() }}</div>
       }
-            <div class="spacer"></div>
+      <div class="spacer"></div>
       @if (telEnabled()) {
-        <span class="tel-ind" [class.conn]="telConnected()" title="Telemetry receiver (Settings → Telemetry)">
+        <span class="tel-ind" [class.conn]="telConnected()" title="Telemetry receiver listening (Settings → Telemetry)">
           <span class="dot"></span>
           @if (telConnected()) {<span class="lbl">client</span>}
         </span>
       }
-      @if (telEnabled()) {
-        <span class="tel-ind" [class.conn]="telConnected()" title="Telemetry receiver (Settings → Telemetry)">
-          <span class="dot"></span>
-          @if (telConnected()) {<span class="lbl">client</span>}
-        </span>
-      }
-        <select class="fav-select inp" [(ngModel)]="favSel" (click)="refreshFavs()"
-                title="Favorite tests — pick one and press Run">
-          @if (favs().length) {
-            <option value="" disabled>★ Favorites…</option>
-            @for (t of favs(); track t.id) {
-              <option [value]="t.id">★ {{ t.title }}</option>
-            }
-          } @else {
-            <option value="" disabled>★ No favorites — star tests on the Tests page</option>
+      <select class="fav-select inp" [(ngModel)]="favSel" (click)="refreshFavs()"
+              title="Favorite tests — pick one and press Run">
+        @if (favs().length) {
+          <option value="" disabled>★ Favorites…</option>
+          @for (t of favs(); track t.id) {
+            <option [value]="t.id">★ {{ t.title }}</option>
           }
-        </select>
-        <button class="btn primary" (click)="runFavorite()" [disabled]="!favSel"
-                title="Run the selected favorite test — streams live on the Chat screen">Run</button>
+        } @else {
+          <option value="" disabled>★ No favorites</option>
+        }
+      </select>
+      <button class="btn primary" (click)="runFavorite()" [disabled]="!favSel"
+              title="Run the selected favorite test — streams live on the Chat screen">Run</button>
     </header>
     <div class="content">
       <router-outlet></router-outlet>

@@ -101,6 +101,39 @@ function renderMarkdown(text: string): string {
   }
 }
 
+/**
+ * Copy text to the clipboard with a capability check and a fallback
+ * (review F3): the async Clipboard API exists only in secure contexts, so on
+ * a plain-HTTP LAN address `navigator.clipboard` is undefined and the old
+ * handler threw "Cannot read properties of undefined (reading 'writeText')"
+ * with no visible feedback. Falls back to execCommand, and ALWAYS reports
+ * the outcome on the button itself.
+ */
+async function copyToClipboard(txt: string): Promise<boolean> {
+  if (window.isSecureContext && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(txt);
+      return true;
+    } catch { /* fall through to the legacy path */ }
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = txt;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '-1000px';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 function decorate(el: HTMLElement): void {
   // code highlighting + copy button
   el.querySelectorAll('pre').forEach((pre) => {
@@ -119,9 +152,15 @@ function decorate(el: HTMLElement): void {
       btn.textContent = '⧉';
       btn.addEventListener('click', () => {
         const txt = (pre.querySelector('code') || pre).textContent || '';
-        navigator.clipboard.writeText(txt).then(() => {
-          btn.textContent = '✓';
-          setTimeout(() => (btn.textContent = '⧉'), 1200);
+        void copyToClipboard(txt).then((ok) => {
+          btn.textContent = ok ? '✓' : '✕';
+          btn.title = ok
+            ? 'Copied!'
+            : 'Automatic copy is unavailable on this connection — select the code and copy manually (Ctrl/Cmd+C)';
+          setTimeout(() => {
+            btn.textContent = '⧉';
+            btn.title = 'Copy code';
+          }, 2400);
         });
       });
       pre.appendChild(btn);

@@ -299,3 +299,36 @@ canvas.dist {
   object-fit: cover;
   flex: 0 0 auto;
 }
+
+/* Direction marker next to the delta (review A4/A5): improvement is stated
+   in text, not only through cell color. */
+.dir {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: rgba(125, 125, 155, 0.14);
+  color: var(--text-muted, #96a1b5);
+  vertical-align: middle;
+}
+.dir.win {
+  background: rgba(63, 182, 139, 0.15);
+  color: #57d9a3;
+}
+.dir.loss {
+  background: rgba(228, 99, 107, 0.15);
+  color: #ff8a96;
+}
+
+/* Compatibility notes (review M3): stated before any verdict. */
+.compat { border-color: rgba(246, 200, 76, .35); margin-bottom: 14px; }
+.compat-head {
+  font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--muted, #94a3b8); margin-bottom: 6px;
+}
+.compat-line { display: flex; gap: 8px; font-size: 12.5px; margin: 3px 0; color: var(--text, #e5e7eb); }
+.compat-line.warn { color: #fbbf24; }
+.compat-ico { flex: 0 0 auto; }

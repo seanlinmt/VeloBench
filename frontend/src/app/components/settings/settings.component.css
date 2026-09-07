@@ -98,3 +98,13 @@ h2 { margin: 0 0 2px; font-size: 20px; }
 /* Managed session categories editor */
 .catchips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
 .catchips .chip.on { cursor: default; }
+
+/* Model readiness check (review M4): untested / verified / failed states. */
+.m-chip.ready .ok { color: #57d9a3; }
+.m-chip.ready .none { color: var(--muted); }
+.m-chip.ready { cursor: help; }
+.btn.mini-check {
+  padding: 2px 9px;
+  font-size: 11px;
+  border-radius: 999px;
+}

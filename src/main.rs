@@ -91,6 +91,9 @@ async fn main() -> anyhow::Result<()> {
         calibrations: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         corpus: std::sync::Arc::new(corpus::CorpusCache::new()),
         conc: std::sync::Arc::new(concurrent::ConcRegistry::new()),
+        cancels: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        live_runs: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        active_session: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
         telemetry: std::sync::Arc::new(telemetry::TelemetryHub::new()),
     };
 

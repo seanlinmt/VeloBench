@@ -19,6 +19,11 @@ export class SettingsComponent implements OnDestroy {
   readonly calib = signal<Record<string, { state: string; ratio?: number; weight?: number; error?: string }>>({});
   /** Per-model resolved tokenizer source (from /api/models/{id}/tokenizer). */
   readonly tokSources = signal<Record<string, string>>({});
+  /** True once every visible entry has been checked — while false, the UI
+   *  must say "checking…" rather than "no tokenizer" (review F7). */
+  readonly tokChecked = signal(false);
+  /** Model entries with a readiness check in flight (review M4). */
+  readonly checkingModels = signal<Set<string>>(new Set());
   private pollTimer: ReturnType<typeof setInterval> | null = null;
 
   ngOnDestroy(): void {
@@ -81,6 +86,44 @@ export class SettingsComponent implements OnDestroy {
       if (!entries.some((e) => e.key === k)) { delete cur[k]; changed = true; }
     }
     if (changed) this.tokSources.set(cur);
+    this.tokChecked.set(true);
+  }
+
+  /** One-shot readiness check (review M4): a tiny live request; the verdict
+   *  and its time persist on the entry so "untested" ≠ "unavailable". */
+  async checkModel(p: any, m: any): Promise<void> {
+    const key = this.mKey(p, m);
+    this.checkingModels.update((s) => new Set(s).add(key));
+    try {
+      await this.api.checkModel(p.id, m.uid || m.id);
+      await this.ss.load();
+    } catch (e: any) {
+      window.alert('Check failed to run: ' + (e?.message || e));
+    } finally {
+      this.checkingModels.update((s) => {
+        const next = new Set(s);
+        next.delete(key);
+        return next;
+      });
+    }
+  }
+
+  readyTitle(m: any): string {
+    if (!m?.last_check) return 'Never checked — being listed does not imply the model is reachable.';
+    const c = m.last_check;
+    return c.ok
+      ? `Verified working at ${this.fmtCheckAt(m)} (tiny live request)`
+      : `Last check FAILED at ${this.fmtCheckAt(m)}: ${c.error || 'unknown error'}`;
+  }
+
+  fmtCheckAt(m: any): string {
+    const at = m?.last_check?.at;
+    if (!at) return '';
+    try {
+      return new Date(at).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' });
+    } catch {
+      return at;
+    }
   }
 
   /** Remove one model (not the provider) after confirmation. */

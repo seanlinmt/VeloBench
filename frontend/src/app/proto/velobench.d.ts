@@ -53,6 +53,18 @@ export namespace velobench {
 
         /** ChatRequest regimesFromSections */
         regimesFromSections?: (boolean|null);
+
+        /** ChatRequest requestId */
+        requestId?: (string|null);
+
+        /** ChatRequest resume */
+        resume?: (boolean|null);
+
+        /** ChatRequest expect */
+        expect?: (string|null);
+
+        /** ChatRequest expectRegex */
+        expectRegex?: (string|null);
     }
 
     /** Represents a ChatRequest. */
@@ -111,6 +123,18 @@ export namespace velobench {
 
         /** ChatRequest regimesFromSections. */
         public regimesFromSections: boolean;
+
+        /** ChatRequest requestId. */
+        public requestId: string;
+
+        /** ChatRequest resume. */
+        public resume: boolean;
+
+        /** ChatRequest expect. */
+        public expect: string;
+
+        /** ChatRequest expectRegex. */
+        public expectRegex: string;
 
         /**
          * Creates a new ChatRequest instance using the specified properties.
@@ -1647,6 +1671,9 @@ export namespace velobench {
 
         /** Done error */
         error?: (string|null);
+
+        /** Done cancelled */
+        cancelled?: (boolean|null);
     }
 
     /** Represents a Done. */
@@ -1687,6 +1714,9 @@ export namespace velobench {
 
         /** Done error. */
         public error: string;
+
+        /** Done cancelled. */
+        public cancelled: boolean;
 
         /**
          * Creates a new Done instance using the specified properties.

@@ -3,6 +3,56 @@
 High-level release notes for VeloBenchmark. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## v0.2.0 — Responsive UX, reports & exports, result validity, benchmarking rigor
+
+A large feature release: eight workstreams (M1–M8) covering the whole tool.
+
+### Concurrent correctness & cancellation (M1)
+- Concurrent steps mirror single-stream semantics; **Stop is now an acknowledged end-to-end
+  cancellation** (no more stranded workers or silent kills).
+- **Fix premature FINISHED status** — run completion is owned by the orchestrator (loop end / stop /
+  fatal error), not by workers going idle between barrier steps. Req steps now stop the run on worker
+  failure like Image steps.
+- Reports show honest concurrent identities and cancellation surfaced in the UI.
+
+### Metric arithmetic & contracts (M2)
+- Report metric arithmetic corrected: ratio, delta signs, provenance, and restored reasoning counts.
+- **Chat:** reload mid-run resumes the live stream instead of killing it; Stop interrupts stalled
+  streams. Server-driven mid-run resume — any tab re-attaches.
+
+### Responsive shell & chat layout (M3)
+- Compact rail, phone drawer, chat-first layout, report toolbar fixes.
+- Copy-code works on plain-HTTP with visible success/failure feedback; loading states no longer read
+  as empty.
+
+### Workflow & discovery UX (M4)
+- **Drafts:** unsaved tests and runner configs survive navigation and reloads.
+- Sessions: search, honest counts, case-insensitive providers, distinct short ids.
+- Test runs: request-based progress, named completion actions, run label on turns.
+
+### Report structure & exports (M5)
+- **Real paginated PDF**, CSV/JSON downloads, labeled scope, transcript transparency.
+- Session detail carries prompt + answer text; health exposes the app version.
+- Print styles: inter-panel text prints dark.
+
+### Accessibility (M6)
+- Named navigation, named charts, real controls, readable labels.
+
+### Result validity assertions (M7)
+- **Server-side assertions** — expected answer / regex judged by the engine, PASS/FAIL everywhere.
+- Assertion inputs in the test editor; PASS/FAIL badges in reports and Runner.
+
+### Benchmarking rigor (M8)
+- Model readiness checks, repeated concurrent plans, comparison compatibility banner, model Check in
+  Settings, repeats input in Runner.
+
+### Backend / fixes
+- **Proxy fix:** an explicit `temperature` on a model entry serialized twice — HTTP 422 on strict
+  engines; now serialized once.
+- **Exports:** CSV and JSON carry the session's title; unnamed sessions fall back to their run/test
+  label in titles.
+- Embedded frontend bundle rebuilt for the new UI.
+
 ## v0.1.1 — Per-step reasoning override, test framework improvements
 
 - **Per-step reasoning override.** Each test step can now set its own reasoning effort

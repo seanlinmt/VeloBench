@@ -328,6 +328,7 @@ export class StatsPanelComponent implements OnInit, AfterViewInit {
         domain: [2, 8],
       });
     }
+    this.labelCanvases();
   }
 
   async exportPNG(): Promise<void> {
@@ -376,6 +377,20 @@ export class StatsPanelComponent implements OnInit, AfterViewInit {
 
   regimeLabelOf(cat: string): string {
     return regimeLabelOf(cat);
+  }
+
+  /** role=img + accessible names from each chart's heading/caption, so the
+   *  live panel reads as named charts, not canvas ids (review U5). */
+  private labelCanvases(): void {
+    for (const cv of this.el.nativeElement.querySelectorAll('canvas')) {
+      if (cv.getAttribute('aria-label')) continue;
+      const card = cv.closest('.chart-card') as HTMLElement | null;
+      const head = card?.querySelector('.chart-head h4')?.textContent?.trim();
+      const unit = card?.querySelector('.chart-unit')?.textContent?.trim();
+      if (!head) continue;
+      cv.setAttribute('role', 'img');
+      cv.setAttribute('aria-label', unit ? `${head}: ${unit}` : head);
+    }
   }
 
   /** Cluster/bimodality annotation for the latency histogram. */

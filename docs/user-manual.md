@@ -26,6 +26,17 @@ Table of contents:
 
 Everything lives in **Settings** (⚙ in the sidebar). Settings are stored
 server-side in `velobench_data/` — they survive browser changes and restarts.
+Each model entry has a **Check** button: a tiny live request verifies the
+entry (auth, model id, reachability) and records when it was verified —
+"untested" stays visibly different from "failed".
+
+**Layout & screens:** on desktop the sidebar shows the full navigation. On
+tablet widths it collapses to a compact icon rail; on phone widths it becomes
+an off-canvas drawer opened with the ☰ button in the top bar (any navigation
+or a tap on the backdrop closes it). On the Chat screen the live-metrics
+panel can be hidden with the **Metrics** toggle so the conversation and
+composer use the full width; on phones it is hidden by default and opens
+below the conversation.
 
 ![Settings](images/settings.png)
 
@@ -60,7 +71,10 @@ instruments attached.
 ![Chat](images/chat.png)
 
 - **Send** any prompt; the answer streams in with server-side live stats.
-- **Stop** mid-generation — the partial turn still records its stats.
+- **Stop** mid-generation cancels the request end-to-end: the server stops
+  consuming the upstream stream and the turn is finalized with its partial
+  output, marked **CANCELLED** in the record and on the restored chat. The
+  button shows *Stopping…* until the server acknowledges the cancellation.
 - **Attach images** — click the attachment control (or paste) to add images to
   a message; they are sent as OpenAI `image_url` parts. Vision-capable models
   describe them; the turn is measured like any other.
@@ -113,7 +127,7 @@ The Tests page (🧪) lists built-in suites and your own tests.
 | Step | Purpose |
 |------|---------|
 | **Section** | Names a sub-test in progress/reports. With **Reset context** it clears the conversation (a fresh sub-test); without it, it is just a marker. When "Treat LLM sessions as regimes" is on, section titles become the regime names in reports. |
-| **Prompt** | Sends text to the model, as-is. Optional per-step generation budget (`tg`) and a **per-step reasoning override** — *inherit* (model config), *off*, or a forced effort level (low/medium/high/xhigh). |
+| **Prompt** | Sends text to the model, as-is. Optional per-step generation budget (`tg`) and a **per-step reasoning override** — *inherit* (model config), *off*, or a forced effort level (low/medium/high/xhigh). Optional **assertions**: an expected substring and/or regex judged against the VISIBLE answer — the run reports PASS/FAIL separately from execution, on the Runner cards and in the report (reasoning text never counts as the answer). |
 | **Context** | Fills the context with an exact lorem-ipsum payload (chosen in K tokens) before the next prompt — cumulative context tests stay exact. |
 | **Bench** | A fixed-shape run: ONE request with `depth` corpus tokens + `pp` measured prompt tokens, generating `tg` tokens. `exact-tg` forces the full generation (no early stop). Independent of history. |
 | **Image** | A vision request: pick one of the embedded test images (dropdown lists them **by size**) and write the prompt (default: *"Please describe this image."*). The image is sent to the model; the turn streams and records like any other. If the model rejects the image (no vision support, provider error), **the test stops and shows the error**. |
@@ -135,22 +149,31 @@ every step unless a step overrides them. Several built-ins demonstrate both.
 
 The Runner (⚡) executes a test with **N workers in parallel**, all walking
 the same plan with a **step barrier**: every worker finishes step *k* before
-any worker starts step *k+1*, so the report stays phase-aligned.
+any worker starts step *k+1*, so the report stays phase-aligned. Step
+interpretation matches the single-stream test runner: prompts are sent as
+typed, an unset generation budget inherits the model default, and workers
+carry their own conversation across steps (reset sections clear it). A run
+of W workers × S barrier steps produces **W×S requests** — the report counts
+workers, steps and requests as separate identities.
 
 ![Runner](images/runner.png)
 
 1. Pick the **provider + model** and the **test** (defaults to the quick
    shape check).
-2. Set the **worker count** and start. Each step shows:
+2. Set the **worker count** and (optionally) **repeats** — the whole plan
+   runs N times inside one session, each repetition's requests labelled
+   `rep k/N`, giving genuine repeat distributions. Each step shows:
    - the current step title and progress bar,
    - one snapshot per worker — state (queued / starting / streaming / done /
      failed), tok/s, TTFT, completion tokens,
    - per-step failures, with the reason.
-3. **Stop** aborts the run; completed turns are kept.
+3. **Stop** aborts the run: in-flight requests stop at the provider, and the
+   partial turns are kept and marked cancelled in the report.
 4. All turns land in **one VeloBenchmark session**, so the normal reports apply —
-   the analytics view adds a **Decode Rate Timeline — Workers + Σ** section
-   showing each worker's decode rate and their sum (your effective
-   concurrency throughput).
+   the analytics view adds a **Decode Rate Timeline — Requests + Σ** section:
+   every request plotted at its true start time plus the summed throughput
+   curve. Rates need at least 2 tokens per request to be measurable —
+   1-token answers show as *insufficient data* instead of inflated tok/s.
 5. Vision steps under load: if a provider errors on an image, the whole test
    stops immediately and the reason shows in the banner — no half-finished
    ambiguity about which shapes ran.
@@ -159,8 +182,13 @@ any worker starts step *k+1*, so the report stays phase-aligned.
 
 The Sessions page (🗂) lists every recorded VeloBenchmarkmark session — chat
 conversations, test runs, concurrent runs — with their turn counts and model
-labels. Open one to jump into its analytics; sessions can be renamed, favourited
-and deleted here.
+labels. A **search box** finds sessions by id, custom name, model, provider or
+test; filter chips group the list (provider names are matched
+case-insensitively, so "DeepSeek" and "Deepseek" are one provider). The header
+counts what is actually visible: *N on this page · M matching · K total*.
+Filters and page position survive leaving and returning from a report. Open a
+session to jump into its analytics; sessions can be renamed, favourited and
+deleted here.
 
 ## Session analytics — what each report shows
 
@@ -180,10 +208,21 @@ The analytics view is the full report for one session.
 - **Quality & Diagnostics** — decode-rate distribution histogram, ITL
   histogram, acceptance-rate estimate and speculation-depth distribution
   (for speculative-decoding servers), first-token latency by request.
-- **Decode Rate Timeline — Workers + Σ** (concurrent sessions only) — every
-  worker's decode rate over time plus their sum: how well the server keeps up
-  as workers stream in parallel.
-- **Export** — the whole report exports to PNG / PDF for sharing.
+- **Decode Rate Timeline — Requests + Σ** (concurrent sessions only) — every
+  request's decode rate at its true start time plus the Σ curve; the header
+  breaks the run down into workers × steps = requests.
+- **Export** — the report exports as:
+  - **PNG** — one full-dashboard image (charts at screen resolution),
+  - **PDF** — a real paginated document: ordinary A4 pages with selectable
+    text, repeated table heads and page numbers (opens the browser's
+    Save-as-PDF dialog; the file name matches the session id),
+  - **CSV** — request-level metrics, one row per recorded request,
+  - **JSON** — the complete per-request analysis payload (provenance,
+    effective settings, timings, regimes) for independent re-derivation.
+  Exports never include provider credentials. The transcript tab offers
+  **Rendered** (regime-colored) and **Raw text** views, and shows each
+  request's user prompt and effective settings (reasoning, budget, token
+  source).
 
 ## Comparing sessions
 
@@ -193,7 +232,11 @@ The Compare page (⇄) puts sessions side by side.
 
 1. Select two or more sessions from the list (chat runs, test runs,
    concurrent runs — any mix).
-2. **Compare selected** creates a persistent comparison.
+2. **Compare selected** creates a persistent comparison. A compatibility
+   note states up front what differs between the two sides — workload,
+   worker count, per-step budgets, token counting — so a "winner" is never
+   read across non-comparable runs (a differing model is called out as the
+   expected case).
 3. The comparison view lays the sessions' headline numbers and timelines next
    to each other — same prompts across models, before/after server tuning,
    single vs concurrent, vision vs text: whatever you line up.

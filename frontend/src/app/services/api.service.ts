@@ -14,6 +14,10 @@ const API = '';
 @Injectable({ providedIn: 'root' })
 export class ApiService {
 
+  async health(): Promise<any> {
+    return this.json(API + '/api/health');
+  }
+
   /** Tokenizer status for one model ENTRY (provider id + entry uid). */
   async modelTokenizerStatus(providerId: string, modelUid: string): Promise<any> {
     return this.json(API + `/api/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelUid)}/tokenizer`);
@@ -53,6 +57,7 @@ export class ApiService {
     fill_tokens: number;
     tg: number;
     workers: number;
+    repeats?: number;
     label?: string;
     test_id?: string;
   }): Promise<any> {
@@ -73,6 +78,16 @@ export class ApiService {
 
   async stopConcurrent(id: string): Promise<any> {
     return this.json(API + `/api/concurrent/${encodeURIComponent(id)}/stop`, { method: 'POST' });
+  }
+
+  /** Cancel one in-flight inference run by request id (acknowledged Stop). */
+  /** One-shot model readiness check (review M4); result persists on the entry. */
+  async checkModel(providerId: string, modelUid: string): Promise<any> {
+    return this.json(API + `/api/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelUid)}/check`, { method: 'POST' });
+  }
+
+  async cancelRequest(requestId: string): Promise<any> {
+    return this.json(API + `/api/cancel/${encodeURIComponent(requestId)}`, { method: 'POST' });
   }
 
   // ---- Saved session comparisons ----

@@ -35,7 +35,19 @@ h2 { margin: 0; font-size: 20px; }
 .regime-strip { display: flex; height: 4px; border-radius: 2px; overflow: hidden; margin-top: 9px; }
 .regime-strip .seg { height: 100%; min-width: 1px; }
 .row.open { border-color: var(--accent); }
-.row-main { display: flex; align-items: center; gap: 14px; }
+.row-main {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+}
 .col { min-width: 0; }
 .col:first-child { flex: 1.4; }
 .col:nth-child(2) { flex: 1; }
@@ -91,3 +103,19 @@ h2 { margin: 0; font-size: 20px; }
 }
 .catrow .catname { font-weight: 600; min-width: 160px; }
 .catrow .cat-actions { margin-left: auto; display: flex; gap: 6px; }
+
+/* Review R2: at phone width the session rows stack — no overlapping action
+   buttons, no sideways scrolling; long model names wrap instead of driving
+   the layout. */
+@media (max-width: 700px) {
+  .row-main { flex-wrap: wrap; gap: 8px; }
+  .col:first-child, .col:nth-child(2), .col:nth-child(3) { flex: 1 1 100%; }
+  .actions { margin-left: 0; width: 100%; display: flex; gap: 8px; flex-wrap: wrap; }
+  .actions .btn { flex: 1 1 auto; }
+  .head { flex-direction: column; align-items: stretch; gap: 8px; }
+  .value { font-size: 17px; }
+}
+
+/* Review U3: free-text search across id/name/model/provider/test. */
+.search-group { align-items: center; }
+.search-inp { max-width: 420px; flex: 1 1 240px; }

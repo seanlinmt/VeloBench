@@ -6,6 +6,12 @@
   display: flex;
   flex-direction: column;
   gap: 14px;
+  padding: 22px 26px;
+  overflow-y: auto;
+  height: 100%;
+}
+@media (max-width: 700px) {
+  .runner { padding: 14px 14px; }
 }
 
 .head h2 {
@@ -197,3 +203,24 @@
 }
 
 .run-error { border: 1px solid rgba(255, 90, 104, 0.5); background: rgba(255, 90, 104, 0.08); color: #ff8a93; border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; }
+
+/* Review R2: phone width — the start-form rows stack cleanly, the start
+   button keeps a tap-friendly size, and worker cards go single-column. */
+@media (max-width: 700px) {
+  .grid { grid-template-columns: 1fr !important; }
+  .start .row .inp.lab { flex: 1 1 140px; min-width: 0; }
+  .run-head { flex-wrap: wrap; gap: 8px; }
+  .run-head .btn { flex: 1 1 auto; }
+}
+
+/* Result-assertion badges on worker cards (review M1). */
+.wassert {
+  margin-left: auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .03em;
+}
+.wassert.ok { background: rgba(63,182,139,.15); color: #57d9a3; }
+.wassert.fail { background: rgba(228,99,107,.18); color: #f87171; }

@@ -42,6 +42,19 @@ pub struct AppState {
     pub corpus: Arc<crate::corpus::CorpusCache>,
     /// Live concurrent-run registry (parallel fixed-shape workers).
     pub conc: Arc<crate::concurrent::ConcRegistry>,
+    /// Cancellation flags per in-flight request id (Stop = end-to-end cancel).
+    pub cancels: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    /// Live in-flight runs keyed by request id: a frame broadcast channel
+    /// (for sockets that re-attach after a page reload) plus the accumulated
+    /// content/reasoning so a resumed client gets an instant snapshot.
+    pub live_runs: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<crate::ws::LiveRun>>>>,
+    /// Mirror of the engine's current session id. The engine lock is held for
+    /// a whole streaming turn; this mirror lets GET /api/session serve the
+    /// correct turn list (from the store) while the lock is busy. Only the ws
+    /// run path mutates it (right after the lock is acquired), so it can only
+    /// be READ while a run is in flight — when idle, the engine itself is
+    /// authoritative and is read directly.
+    pub active_session: Arc<std::sync::Mutex<String>>,
     /// Session ids with an analysis currently in flight (guards double-start).
     pub analyzing: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     /// Mini OTel receiver state (streams, status, listener handle).
@@ -78,6 +91,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/models/{id}/calibrate", post(calibrate_model))
         .route("/api/models/{id}/tokenizer", get(get_tokenizer_status).put(put_tokenizer_override))
         .route("/api/providers/{pid}/models/{muid}/tokenizer", get(get_tokenizer_status_pair).put(put_tokenizer_override_pair))
+        .route("/api/providers/{pid}/models/{muid}/check", post(check_model))
         .route("/api/providers/{pid}/models/{muid}/calibrate", post(calibrate_model))
         .route("/api/calibrations", get(list_calibrations))
         .route("/api/providers/{pid}/models/{mid}", axum::routing::delete(delete_provider_model))
@@ -87,6 +101,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/concurrent", get(list_concurrent).post(start_concurrent))
         .route("/api/concurrent/{id}", get(get_concurrent))
         .route("/api/concurrent/{id}/stop", post(stop_concurrent))
+        .route("/api/cancel/{request_id}", post(cancel_request))
         .route("/api/test-images", get(test_images))
         .route("/api/comparisons", get(list_comparisons).post(add_comparison))
         .route("/api/comparisons/{id}", delete(delete_comparison))
@@ -97,15 +112,34 @@ pub fn router(state: AppState) -> Router {
 // ---------- health ----------
 
 async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true, "name": "velobench" }))
+    Json(serde_json::json!({ "ok": true, "name": "velobench", "version": env!("CARGO_PKG_VERSION") }))
 }
 
 /// Current session snapshot (graphs/labels are restored from this) + the recorded
 /// turns belonging to it, so a page reload can rebuild the conversation.
 async fn get_session(State(st): State<AppState>) -> Json<serde_json::Value> {
-    let engine = st.stats.lock().await;
-    let mut snapshot = engine.session_snapshot();
-    let session_id = engine.session_id().to_string();
+    // The engine lock is held for the WHOLE duration of a streaming turn. A
+    // client reloading mid-run must not block here until generation ends —
+    // it needs the recorded turns + the in-flight marker immediately (the
+    // live stream itself is re-attached via the resume path). Serve a light
+    // "active" snapshot when the engine is busy.
+    let mut snapshot = match st.stats.try_lock() {
+        Ok(engine) => engine.session_snapshot(),
+        Err(_) => serde_json::json!({
+            "active": true,
+            "session_id": "",
+            "samples": [], "latencies": [], "clusters": null,
+            "acceptance": [], "spec_depth": [], "regimes": [],
+            "category": null, "live": null, "final": null,
+            "content": "", "reasoning": "",
+        }),
+    };
+    // While a run holds the engine lock, the mirror has just been refreshed
+    // by that very run (it writes the id right after acquiring the lock).
+    let session_id = match st.stats.try_lock() {
+        Ok(engine) => engine.session_id().to_string(),
+        Err(_) => st.active_session.lock().unwrap().clone(),
+    };
     let mut all = st.store.benchmarks().await;
     all.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     let turns: Vec<serde_json::Value> = all
@@ -118,10 +152,34 @@ async fn get_session(State(st): State<AppState>) -> Json<serde_json::Value> {
             "reasoning": b.reasoning,
             "created_at": b.created_at,
             "meta": b.meta.get("line").and_then(|v| v.as_str()).unwrap_or(""),
+            "status": b.status,
+            "request_id": b.request_id,
+            // Recorded reasoning token count: the restored chat must show the
+            // same count as the report, never a default zero (review F5).
+            "reasoning_tokens": b.stats.reasoning_tokens,
         }))
         .collect();
-    drop(engine);
     snapshot["turns"] = serde_json::Value::Array(turns);
+    // An in-flight run for THIS session (if any): the reloaded client uses
+    // this to re-render the user turn and re-attach to the live stream —
+    // server-driven, so it works from any tab and needs no client storage.
+    snapshot["inflight"] = st
+        .live_runs
+        .lock()
+        .await
+        .values()
+        .find(|r| r.session == session_id)
+        .map(|r| {
+            let info = r.info.lock().unwrap();
+            serde_json::json!({
+                "requestId": r.request_id,
+                "kind": info.kind,
+                "userContent": info.user_content,
+                "images": info.images,
+                "fillTokens": info.fill_tokens,
+            })
+        })
+        .unwrap_or(serde_json::Value::Null);
     Json(snapshot)
 }
 
@@ -1021,6 +1079,96 @@ async fn stop_concurrent(
     AxumPath(id): AxumPath<String>,
 ) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": crate::concurrent::request_stop(&st, &id) }))
+}
+
+/// One-shot model readiness check (review M4): a minimal live request
+/// verifies the entry (auth, model id, billing, reachability). The result
+/// and its time are persisted on the model entry — "untested" stays visibly
+/// different from "unavailable".
+async fn check_model(
+    State(st): State<AppState>,
+    AxumPath((pid, muid)): AxumPath<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let settings = st.store.settings().await;
+    let provider = settings
+        .providers
+        .iter()
+        .find(|p| p.id == pid)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown provider".into()))?;
+    let model = provider
+        .models
+        .iter()
+        .find(|m| m.uid == muid || m.id == muid)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown model".into()))?;
+    let payload = crate::models::ChatPayload {
+        model: model.id.clone(),
+        messages: vec![crate::models::ChatMessage {
+            role: "user".into(),
+            content: serde_json::Value::String("Reply with exactly: OK".into()),
+            name: None,
+        }],
+        stream: false,
+        stream_options: None,
+        reasoning_effort: None,
+        temperature: Some(0.0),
+        extra: serde_json::json!({ "max_tokens": 8 })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    };
+    let model_id = model.id.clone();
+    let provider = provider.clone();
+    drop(settings);
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        crate::proxy::complete_chat(&st.http, &provider, &payload),
+    )
+    .await;
+    let check = match res {
+        Err(_) => crate::settings::ModelCheck {
+            at: chrono::Utc::now().to_rfc3339(),
+            ok: false,
+            error: Some("timed out after 45 s".into()),
+        },
+        Ok(Err(e)) => crate::settings::ModelCheck {
+            at: chrono::Utc::now().to_rfc3339(),
+            ok: false,
+            error: Some(e.to_string()),
+        },
+        Ok(Ok(_)) => crate::settings::ModelCheck {
+            at: chrono::Utc::now().to_rfc3339(),
+            ok: true,
+            error: None,
+        },
+    };
+    // Persist onto the entry (by uid, mirroring the calibration write path).
+    let mut s2 = st.store.settings().await;
+    if let Some(p) = s2.providers.iter_mut().find(|p| p.id == pid) {
+        for m in p.models.iter_mut() {
+            if m.uid == muid || (muid.is_empty() && m.id == model_id) {
+                m.last_check = Some(check.clone());
+            }
+        }
+    }
+    st.store.set_settings(s2).await;
+    Ok(Json(serde_json::json!({ "ok": check.ok, "at": check.at, "error": check.error })))
+}
+
+/// Cancel one in-flight inference run by its request id: sets the shared
+/// flag the stream loop checks, so upstream consumption stops promptly and
+/// the turn is finalized with an acknowledged cancelled state.
+async fn cancel_request(
+    State(st): State<AppState>,
+    AxumPath(request_id): AxumPath<String>,
+) -> Json<serde_json::Value> {
+    let flag = st.cancels.lock().await.get(&request_id).cloned();
+    match flag {
+        Some(f) => {
+            f.store(true, std::sync::atomic::Ordering::Relaxed);
+            Json(serde_json::json!({ "ok": true, "known": true }))
+        }
+        None => Json(serde_json::json!({ "ok": true, "known": false })),
+    }
 }
 
 // ---- Saved session comparisons --------------------------------------------

@@ -3,8 +3,14 @@
     <h2>Sessions</h2>
     @if (viewTab() === 'sessions') {
       <div class="head-right">
-        <div class="muted">{{ filteredSessions().length }} of {{ sessions().length }} shown</div>
-        @if (sessions().length) {
+        @if (!loaded()) {
+          <div class="muted">Loading sessions…</div>
+        } @else {
+          <div class="muted" [title]="'Page ' + viewPage() + ' of ' + totalPages()">
+            {{ pagedSessions().length }} on this page · {{ filteredSessions().length }} matching@if (filteredSessions().length !== sessions().length) {<span> · {{ sessions().length }} total</span>}
+          </div>
+        }
+        @if (loaded() && sessions().length) {
           <button class="btn" [class.on]="selectionMode()" (click)="toggleSelectionMode()">{{ selectionMode() ? 'Cancel' : 'Select' }}</button>
         }
       </div>
@@ -20,8 +26,20 @@
 
 
 @if (viewTab() === 'sessions') {
-@if (sessions().length) {
+@if (loadError()) {
+  <div class="empty muted card">Could not load sessions: {{ loadError() }} — retrying on the next poll.</div>
+} @else if (!loaded()) {
+  <div class="empty muted card">Loading sessions…</div>
+} @else if (sessions().length) {
     <div class="filters card">
+      <div class="fgroup search-group">
+        <span class="flabel">Search</span>
+        <input class="inp search-inp" type="search" placeholder="session id, name, model, provider, test…"
+               [value]="search()" (input)="search.set($any($event.target).value); page.set(1)" />
+        @if (search()) {
+          <button class="chip" (click)="search.set(''); page.set(1)" title="Clear search">✕ clear</button>
+        }
+      </div>
       <div class="fgroup">
         <span class="flabel">Type</span>
         <button class="chip" [class.on]="filterKinds().has('single')" (click)="toggleKind('single')">single</button>
@@ -80,7 +98,11 @@
       <div class="row card"
            [class.open]="!selectionMode() && selected() === g.session"
            [class.sel]="selectionMode() && isChecked(g.session)">
-        <div class="row-main" (click)="selectionMode() ? toggleCheck(g.session) : toggle(g.session)">
+        <button class="row-main" type="button"
+                (click)="selectionMode() ? toggleCheck(g.session) : toggle(g.session)"
+                [attr.aria-pressed]="selectionMode() ? isChecked(g.session) : null"
+                [attr.aria-expanded]="!selectionMode() ? (selected() === g.session) : null"
+                [attr.aria-label]="selectionMode() ? 'Select session ' + (sessionName(g) || g.session) : 'Expand session ' + (sessionName(g) || g.session)">
           @if (selectionMode()) {
             <div class="check" [class.on]="isChecked(g.session)">✓</div>
           }
@@ -99,7 +121,7 @@
               }
             </div>
             <div class="muted small">
-              {{ g.turns.length }} turn(s) · {{ fmtDate(g.createdAt) }} · <span class="mono">{{ g.session.slice(0, 8) }}</span>
+              {{ g.turns.length }} turn(s) · {{ fmtDate(g.createdAt) }} · <span class="mono" title="{{ g.session }}">{{ shortId(g.session) }}</span>
               @if (overallTokS(g); as r) {
                 · <span class="mono" title="Overall decode rate — total output tokens ÷ total decode time across turns">{{ r.toFixed(1) }} tok/s</span>
               }
@@ -143,15 +165,17 @@
               } @else {
                 <button class="btn primary" (click)="view(g.session); $event.stopPropagation()">View</button>
                 @if (a && a.status === 'done') {
-                  <button class="btn" (click)="analyze(g); $event.stopPropagation()">{{ isStale(g) ? 'Re-analyze with AI' : 'Re-run with AI' }}</button>
+                  <button class="btn" (click)="analyze(g); $event.stopPropagation()"
+                          [title]="'Re-run the AI-assisted analysis with the configured helper model (' + helperName() + ') — not the generation model'">{{ isStale(g) ? 'Re-analyze with ' + helperName() : 'Re-run with ' + helperName() }}</button>
                 } @else {
-                  <button class="btn" (click)="analyze(g); $event.stopPropagation()">Analyze with AI</button>
+                  <button class="btn" (click)="analyze(g); $event.stopPropagation()"
+                          [title]="'Run the AI-assisted analysis with the configured helper model (' + helperName() + ') — not the generation model. The report labels every turn by output regime.'">Analyze with {{ helperName() }}</button>
                 }
               }
               <button class="btn danger" (click)="remove(g); $event.stopPropagation()">Del</button>
             </div>
           }
-        </div>
+        </button>
 
         @let strip = stripFor(g);
         @if (strip.length) {

@@ -1,5 +1,6 @@
-import { Component, computed, ElementRef, OnInit, ViewChild, effect } from '@angular/core';
+import { Component, computed, ElementRef, OnInit, signal, ViewChild, effect } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { Router } from '@angular/router';
 import { SettingsService } from '../../services/settings.service';
 import { StatsEngine } from '../../services/stats-engine.service';
 import { ChatSessionService, MAX_ATTACH } from '../../services/chat-session.service';
@@ -22,6 +23,9 @@ export class ChatComponent implements OnInit {
   }
   get streaming() {
     return this.session.streaming;
+  }
+  get stopping() {
+    return this.session.stopping;
   }
   get streamContent() {
     return this.session.streamContent;
@@ -52,6 +56,11 @@ export class ChatComponent implements OnInit {
     if (confirm('Stop the test? The session will NOT be saved.')) {
       void this.session.testStop();
     }
+  }
+
+  /** Open the saved analytics report of a finished test run (review U2). */
+  viewModelReport(session: string): void {
+    void this.router.navigate(['/analytics', session]);
   }
 
   truncDesc(s: string): string {
@@ -103,6 +112,7 @@ export class ChatComponent implements OnInit {
 
   constructor(
     public session: ChatSessionService,
+    private router: Router,
     private ss: SettingsService,
     private engine: StatsEngine,
   ) {
@@ -180,6 +190,14 @@ export class ChatComponent implements OnInit {
    */
   onSummaryClick(e: Event): void {
     if (this.streaming()) e.preventDefault();
+  }
+
+  /** Live-metrics panel visibility (review U1): the conversation + composer
+   *  are the primary surface; the analytics panel is a deliberate toggle.
+   *  Defaults closed on phone/narrow screens, open on desktop. */
+  readonly metricsOpen = signal(typeof window !== 'undefined' && window.innerWidth > 820);
+  toggleMetrics(): void {
+    this.metricsOpen.update((v) => !v);
   }
 
   currentModelLabel(): string {

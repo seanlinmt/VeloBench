@@ -38,6 +38,10 @@ export const velobench = $root.velobench = (() => {
          * @property {string|null} [session] ChatRequest session
          * @property {string|null} [section] ChatRequest section
          * @property {boolean|null} [regimesFromSections] ChatRequest regimesFromSections
+         * @property {string|null} [requestId] ChatRequest requestId
+         * @property {boolean|null} [resume] ChatRequest resume
+         * @property {string|null} [expect] ChatRequest expect
+         * @property {string|null} [expectRegex] ChatRequest expectRegex
          */
 
         /**
@@ -186,6 +190,38 @@ export const velobench = $root.velobench = (() => {
         ChatRequest.prototype.regimesFromSections = false;
 
         /**
+         * ChatRequest requestId.
+         * @member {string} requestId
+         * @memberof velobench.ChatRequest
+         * @instance
+         */
+        ChatRequest.prototype.requestId = "";
+
+        /**
+         * ChatRequest resume.
+         * @member {boolean} resume
+         * @memberof velobench.ChatRequest
+         * @instance
+         */
+        ChatRequest.prototype.resume = false;
+
+        /**
+         * ChatRequest expect.
+         * @member {string} expect
+         * @memberof velobench.ChatRequest
+         * @instance
+         */
+        ChatRequest.prototype.expect = "";
+
+        /**
+         * ChatRequest expectRegex.
+         * @member {string} expectRegex
+         * @memberof velobench.ChatRequest
+         * @instance
+         */
+        ChatRequest.prototype.expectRegex = "";
+
+        /**
          * Creates a new ChatRequest instance using the specified properties.
          * @function create
          * @memberof velobench.ChatRequest
@@ -247,6 +283,14 @@ export const velobench = $root.velobench = (() => {
                 writer.uint32(/* id 15, wireType 0 =*/120).uint32(message.fillTokens);
             if (message.modelUid != null && Object.hasOwnProperty.call(message, "modelUid"))
                 writer.uint32(/* id 16, wireType 2 =*/130).string(message.modelUid);
+            if (message.requestId != null && Object.hasOwnProperty.call(message, "requestId"))
+                writer.uint32(/* id 17, wireType 2 =*/138).string(message.requestId);
+            if (message.resume != null && Object.hasOwnProperty.call(message, "resume"))
+                writer.uint32(/* id 18, wireType 0 =*/144).bool(message.resume);
+            if (message.expect != null && Object.hasOwnProperty.call(message, "expect"))
+                writer.uint32(/* id 19, wireType 2 =*/154).string(message.expect);
+            if (message.expectRegex != null && Object.hasOwnProperty.call(message, "expectRegex"))
+                writer.uint32(/* id 20, wireType 2 =*/162).string(message.expectRegex);
             return writer;
         };
 
@@ -365,6 +409,22 @@ export const velobench = $root.velobench = (() => {
                         message.regimesFromSections = reader.bool();
                         break;
                     }
+                case 17: {
+                        message.requestId = reader.string();
+                        break;
+                    }
+                case 18: {
+                        message.resume = reader.bool();
+                        break;
+                    }
+                case 19: {
+                        message.expect = reader.string();
+                        break;
+                    }
+                case 20: {
+                        message.expectRegex = reader.string();
+                        break;
+                    }
                 default:
                     reader.skipType(tag & 7, long);
                     break;
@@ -469,6 +529,18 @@ export const velobench = $root.velobench = (() => {
             if (message.regimesFromSections != null && Object.hasOwnProperty.call(message, "regimesFromSections"))
                 if (typeof message.regimesFromSections !== "boolean")
                     return "regimesFromSections: boolean expected";
+            if (message.requestId != null && Object.hasOwnProperty.call(message, "requestId"))
+                if (!$util.isString(message.requestId))
+                    return "requestId: string expected";
+            if (message.resume != null && Object.hasOwnProperty.call(message, "resume"))
+                if (typeof message.resume !== "boolean")
+                    return "resume: boolean expected";
+            if (message.expect != null && Object.hasOwnProperty.call(message, "expect"))
+                if (!$util.isString(message.expect))
+                    return "expect: string expected";
+            if (message.expectRegex != null && Object.hasOwnProperty.call(message, "expectRegex"))
+                if (!$util.isString(message.expectRegex))
+                    return "expectRegex: string expected";
             return null;
         };
 
@@ -538,6 +610,14 @@ export const velobench = $root.velobench = (() => {
                 message.section = String(object.section);
             if (object.regimesFromSections != null)
                 message.regimesFromSections = Boolean(object.regimesFromSections);
+            if (object.requestId != null)
+                message.requestId = String(object.requestId);
+            if (object.resume != null)
+                message.resume = Boolean(object.resume);
+            if (object.expect != null)
+                message.expect = String(object.expect);
+            if (object.expectRegex != null)
+                message.expectRegex = String(object.expectRegex);
             return message;
         };
 
@@ -577,6 +657,10 @@ export const velobench = $root.velobench = (() => {
                 object.resetStats = false;
                 object.fillTokens = 0;
                 object.modelUid = "";
+                object.requestId = "";
+                object.resume = false;
+                object.expect = "";
+                object.expectRegex = "";
             }
             if (message.providerId != null && Object.hasOwnProperty.call(message, "providerId"))
                 object.providerId = message.providerId;
@@ -616,6 +700,14 @@ export const velobench = $root.velobench = (() => {
                 object.fillTokens = message.fillTokens;
             if (message.modelUid != null && Object.hasOwnProperty.call(message, "modelUid"))
                 object.modelUid = message.modelUid;
+            if (message.requestId != null && Object.hasOwnProperty.call(message, "requestId"))
+                object.requestId = message.requestId;
+            if (message.resume != null && Object.hasOwnProperty.call(message, "resume"))
+                object.resume = message.resume;
+            if (message.expect != null && Object.hasOwnProperty.call(message, "expect"))
+                object.expect = message.expect;
+            if (message.expectRegex != null && Object.hasOwnProperty.call(message, "expectRegex"))
+                object.expectRegex = message.expectRegex;
             return object;
         };
 
@@ -4803,6 +4895,7 @@ export const velobench = $root.velobench = (() => {
          * @property {number|null} [reasoningTokens] Done reasoningTokens
          * @property {string|null} [meta] Done meta
          * @property {string|null} [error] Done error
+         * @property {boolean|null} [cancelled] Done cancelled
          */
 
         /**
@@ -4901,6 +4994,14 @@ export const velobench = $root.velobench = (() => {
         Done.prototype.error = "";
 
         /**
+         * Done cancelled.
+         * @member {boolean} cancelled
+         * @memberof velobench.Done
+         * @instance
+         */
+        Done.prototype.cancelled = false;
+
+        /**
          * Creates a new Done instance using the specified properties.
          * @function create
          * @memberof velobench.Done
@@ -4948,6 +5049,8 @@ export const velobench = $root.velobench = (() => {
                 writer.uint32(/* id 9, wireType 2 =*/74).string(message.meta);
             if (message.error != null && Object.hasOwnProperty.call(message, "error"))
                 writer.uint32(/* id 10, wireType 2 =*/82).string(message.error);
+            if (message.cancelled != null && Object.hasOwnProperty.call(message, "cancelled"))
+                writer.uint32(/* id 11, wireType 0 =*/88).bool(message.cancelled);
             return writer;
         };
 
@@ -5038,6 +5141,10 @@ export const velobench = $root.velobench = (() => {
                         message.error = reader.string();
                         break;
                     }
+                case 11: {
+                        message.cancelled = reader.bool();
+                        break;
+                    }
                 default:
                     reader.skipType(tag & 7, long);
                     break;
@@ -5112,6 +5219,9 @@ export const velobench = $root.velobench = (() => {
             if (message.error != null && Object.hasOwnProperty.call(message, "error"))
                 if (!$util.isString(message.error))
                     return "error: string expected";
+            if (message.cancelled != null && Object.hasOwnProperty.call(message, "cancelled"))
+                if (typeof message.cancelled !== "boolean")
+                    return "cancelled: boolean expected";
             return null;
         };
 
@@ -5153,6 +5263,8 @@ export const velobench = $root.velobench = (() => {
                 message.meta = String(object.meta);
             if (object.error != null)
                 message.error = String(object.error);
+            if (object.cancelled != null)
+                message.cancelled = Boolean(object.cancelled);
             return message;
         };
 
@@ -5184,6 +5296,7 @@ export const velobench = $root.velobench = (() => {
                 object.reasoningTokens = 0;
                 object.meta = "";
                 object.error = "";
+                object.cancelled = false;
             }
             if (message.totalMs != null && Object.hasOwnProperty.call(message, "totalMs"))
                 object.totalMs = options.json && !isFinite(message.totalMs) ? String(message.totalMs) : message.totalMs;
@@ -5205,6 +5318,8 @@ export const velobench = $root.velobench = (() => {
                 object.meta = message.meta;
             if (message.error != null && Object.hasOwnProperty.call(message, "error"))
                 object.error = message.error;
+            if (message.cancelled != null && Object.hasOwnProperty.call(message, "cancelled"))
+                object.cancelled = message.cancelled;
             return object;
         };
 

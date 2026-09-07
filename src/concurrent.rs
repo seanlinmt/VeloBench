@@ -42,6 +42,8 @@ pub struct WorkerSnap {
     /// Which plan step (1-based) this snapshot describes.
     pub step: usize,
     pub step_title: String,
+    /// Result-assertion verdict (review M1): None = no assertion configured.
+    pub assert_pass: Option<bool>,
 }
 
 impl WorkerSnap {
@@ -57,6 +59,7 @@ impl WorkerSnap {
             error: None,
             step: 0,
             step_title: String::new(),
+            assert_pass: None,
         }
     }
 }
@@ -72,6 +75,8 @@ pub struct ConcRun {
     pub fill_tokens: u32,
     pub tg: u32,
     pub workers: usize,
+    /// How many times the plan repeats inside this run (review M2).
+    pub repeats: usize,
     /// All turns are recorded into this single VeloBenchmark session.
     pub session: String,
     pub started_at: String,
@@ -91,15 +96,36 @@ pub struct ConcRun {
 }
 
 /// One executable step of a run plan. `Marker` is a phase rename only
-/// (a test Section); `Req` streams one request from EVERY worker, in
-/// lockstep — the barrier.
+/// (a test Section; `reset` also clears every worker's conversation);
+/// `Req` streams ONE request from EVERY worker, in lockstep — the barrier.
+/// Step interpretation mirrors the single-stream test runner (chat path):
+/// prompt text is sent as typed, an unset budget (tg = 0) inherits the
+/// model default, and non-bench steps replay their worker's conversation.
 #[derive(Clone, Debug)]
 pub enum PlanStep {
-    Marker { title: String },
-    Req { title: String, fill_tokens: u32, tg: u32, exact_tg: bool, temperature: Option<f64>, reasoning_effort: String },
+    Marker { title: String, reset: bool },
+    Req {
+        title: String,
+        /// The real prompt text (prompt steps). Fill steps (context/bench)
+        /// use a placeholder that the server replaces with an exact corpus
+        /// payload of `fill_tokens` size.
+        prompt: String,
+        fill_tokens: u32,
+        /// Generation budget override; 0 = no override (provider default).
+        tg: u32,
+        exact_tg: bool,
+        temperature: Option<f64>,
+        reasoning_effort: String,
+        /// Bench steps measure a SINGLE stateless request: no history replay.
+        stateless: bool,
+        /// Result assertions (review M1): expected substring / regex for the
+        /// visible output. Empty = no assertion.
+        expect: String,
+        expect_regex: String,
+    },
     /// Image step: ONE vision request per worker (image + prompt), then the
     /// barrier applies as usual. A vision error STOPS the whole test.
-    Img { title: String, image: String, prompt: String, tg: u32, reasoning_effort: String },
+    Img { title: String, image: String, prompt: String, tg: u32, reasoning_effort: String, expect: String, expect_regex: String },
 }
 
 #[derive(Default)]
@@ -162,6 +188,10 @@ pub struct StartConc {
     pub tg: u32,
     #[serde(default = "default_workers")]
     pub workers: u32,
+    /// Repeat the whole plan N times inside ONE run/session (review M2:
+    /// distributions across genuinely repeated runs). Clamped to 1..=10.
+    #[serde(default)]
+    pub repeats: u32,
     #[serde(default)]
     pub label: String,
     /// Run a library test (any test) with N synchronized workers. Empty =
@@ -178,57 +208,127 @@ fn default_workers() -> u32 {
 }
 
 /// Expand a library test into the run plan. Every non-section step becomes
-/// one barrier step; a Section renames the phase and titles the steps that
-/// follow it until the next Section. A section whose title starts with
-/// "warmup" marks warm-up shapes (they run, but the label says so).
+/// one barrier step; a Section renames the phase (and, when marked "reset",
+/// clears the workers' conversations) and titles the steps that follow it
+/// until the next Section. When a phase holds several executable steps they
+/// get disambiguating titles ("Arithmetic · 1/2") so reports can tell the
+/// requests apart. The generation budget mirrors the single-stream runner:
+/// a step budget wins, then the test-level max_tokens, then no override at
+/// all (tg = 0 → the provider/model default — never a 1-token budget).
 fn plan_from_test(t: &crate::tests::TestDef) -> Vec<PlanStep> {
+    // Effective budget per step: step tg > 0 wins, else the test-level
+    // max_tokens, else 0 (no override).
+    let eff_tg = |s: &crate::tests::TestStep| -> u32 {
+        if s.tg > 0 {
+            s.tg
+        } else {
+            t.max_tokens.unwrap_or(0).min(u32::MAX as u64) as u32
+        }
+    };
+    // Count executable steps per phase so multi-step phases get numbered.
+    let mut per_phase: HashMap<String, usize> = HashMap::new();
+    let mut phase_of: Vec<String> = Vec::new();
+    let mut phase = String::new();
+    for s in &t.steps {
+        match s.kind.as_str() {
+            "section" => phase = s.title.trim().to_string(),
+            "prompt" | "context" | "bench" | "image" => {
+                per_phase.entry(phase.clone()).and_modify(|n| *n += 1).or_insert(1);
+                phase_of.push(phase.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let step_title = |phase: &str, multi: bool, n: usize, fallback: String| -> String {
+        if phase.is_empty() {
+            fallback
+        } else if multi {
+            format!("{phase} · {n}")
+        } else {
+            phase.to_string()
+        }
+    };
+
     let mut out: Vec<PlanStep> = Vec::new();
     let mut phase = String::new();
     for s in &t.steps {
         match s.kind.as_str() {
             "section" => {
                 phase = s.title.trim().to_string();
-                out.push(PlanStep::Marker { title: phase.clone() });
+                out.push(PlanStep::Marker { title: phase.clone(), reset: s.reset });
             }
-            "prompt" => out.push(PlanStep::Req {
-                title: if phase.is_empty() { "prompt".into() } else { phase.clone() },
-                fill_tokens: 0,
-                tg: s.tg.max(1),
-                exact_tg: s.exact_tg,
-                temperature: t.temperature,
-                reasoning_effort: s.reasoning_effort.clone(),
-            }),
-            "context" => out.push(PlanStep::Req {
-                title: if phase.is_empty() { format!("fill {}K", s.k) } else { phase.clone() },
-                fill_tokens: s.k.saturating_mul(1024),
-                tg: s.tg.max(1),
-                exact_tg: s.exact_tg,
-                temperature: t.temperature,
-                reasoning_effort: s.reasoning_effort.clone(),
-            }),
-            "bench" => out.push(PlanStep::Req {
-                title: if phase.is_empty() {
-                    format!("d{} + pp{} → tg{}", s.depth, s.pp, s.tg)
-                } else {
-                    phase.clone()
-                },
-                fill_tokens: s.depth.saturating_add(s.pp),
-                tg: s.tg.max(1),
-                exact_tg: s.exact_tg,
-                temperature: t.temperature,
-                reasoning_effort: s.reasoning_effort.clone(),
-            }),
-            "image" => out.push(PlanStep::Img {
-                title: if phase.is_empty() { "image".into() } else { phase.clone() },
-                image: s.image.clone(),
-                prompt: if s.prompt.trim().is_empty() {
-                    "Please describe this image.".into()
-                } else {
-                    s.prompt.clone()
-                },
-                tg: if s.tg > 0 { s.tg } else { 512 },
-                reasoning_effort: s.reasoning_effort.clone(),
-            }),
+            "prompt" => {
+                let n = { let v = seen.entry(phase.clone()).and_modify(|n| *n += 1).or_insert(1); *v };
+                let total = per_phase.get(&phase).copied().unwrap_or(1);
+                let title = step_title(&phase, total > 1, n, "prompt".into());
+                out.push(PlanStep::Req {
+                    title,
+                    prompt: s.text.clone(),
+                    fill_tokens: 0,
+                    tg: eff_tg(s),
+                    exact_tg: s.exact_tg,
+                    temperature: t.temperature,
+                    reasoning_effort: s.reasoning_effort.clone(),
+                    stateless: false,
+                    expect: s.expect.clone(),
+                    expect_regex: s.expect_regex.clone(),
+                });
+            }
+            "context" => {
+                let n = { let v = seen.entry(phase.clone()).and_modify(|n| *n += 1).or_insert(1); *v };
+                let total = per_phase.get(&phase).copied().unwrap_or(1);
+                let title = step_title(&phase, total > 1, n, format!("fill {}K", s.k));
+                out.push(PlanStep::Req {
+                    title,
+                    prompt: String::new(),
+                    fill_tokens: s.k.saturating_mul(1024),
+                    tg: eff_tg(s),
+                    exact_tg: s.exact_tg,
+                    temperature: t.temperature,
+                    reasoning_effort: s.reasoning_effort.clone(),
+                    stateless: false,
+                    expect: s.expect.clone(),
+                    expect_regex: s.expect_regex.clone(),
+                });
+            }
+            "bench" => {
+                let n = { let v = seen.entry(phase.clone()).and_modify(|n| *n += 1).or_insert(1); *v };
+                let total = per_phase.get(&phase).copied().unwrap_or(1);
+                let title = step_title(&phase, total > 1, n, format!("d{} + pp{} → tg{}", s.depth, s.pp, s.tg));
+                out.push(PlanStep::Req {
+                    title,
+                    prompt: String::new(),
+                    fill_tokens: s.depth.saturating_add(s.pp),
+                    tg: eff_tg(s),
+                    exact_tg: s.exact_tg,
+                    temperature: t.temperature,
+                    reasoning_effort: s.reasoning_effort.clone(),
+                    // Bench shapes measure ONE request (context+prompt in a
+                    // single payload) — stateless, like the single-stream path.
+                    stateless: true,
+                    expect: s.expect.clone(),
+                    expect_regex: s.expect_regex.clone(),
+                });
+            }
+            "image" => {
+                let n = { let v = seen.entry(phase.clone()).and_modify(|n| *n += 1).or_insert(1); *v };
+                let total = per_phase.get(&phase).copied().unwrap_or(1);
+                let title = step_title(&phase, total > 1, n, "image".into());
+                out.push(PlanStep::Img {
+                    title,
+                    image: s.image.clone(),
+                    prompt: if s.prompt.trim().is_empty() {
+                        "Please describe this image.".into()
+                    } else {
+                        s.prompt.clone()
+                    },
+                    tg: eff_tg(s),
+                    reasoning_effort: s.reasoning_effort.clone(),
+                    expect: s.expect.clone(),
+                    expect_regex: s.expect_regex.clone(),
+                });
+            }
             _ => {}
         }
     }
@@ -263,6 +363,7 @@ pub async fn start(st: &AppState, req: StartConc) -> Result<ConcRun, String> {
     let model = model_cfg.id.clone();
     let model_uid = model_cfg.uid.clone();
     let workers = req.workers.clamp(1, 64) as usize;
+    let repeats = req.repeats.clamp(1, 10) as usize;
     let tg = req.tg.max(1);
     let fill_tokens = req.fill_tokens;
 
@@ -285,11 +386,15 @@ pub async fn start(st: &AppState, req: StartConc) -> Result<ConcRun, String> {
         (
             vec![PlanStep::Req {
                 title: title.clone(),
+                prompt: String::new(),
                 fill_tokens,
                 tg,
                 exact_tg: false,
                 temperature: None,
                 reasoning_effort: String::new(),
+                stateless: true,
+                expect: String::new(),
+                expect_regex: String::new(),
             }],
             String::new(),
             title.clone(),
@@ -304,7 +409,8 @@ pub async fn start(st: &AppState, req: StartConc) -> Result<ConcRun, String> {
     let n_steps = plan
         .iter()
         .filter(|p| matches!(p, PlanStep::Req { .. } | PlanStep::Img { .. }))
-        .count();
+        .count()
+        * repeats;
 
     let run = ConcRun {
         id: id.clone(),
@@ -316,6 +422,7 @@ pub async fn start(st: &AppState, req: StartConc) -> Result<ConcRun, String> {
         fill_tokens,
         tg,
         workers,
+        repeats,
         session: session.clone(),
         started_at: chrono::Utc::now().to_rfc3339(),
         finished: false,
@@ -364,32 +471,50 @@ fn set_worker(st: &AppState, id: &str, idx: usize, f: impl FnOnce(&mut WorkerSna
 
 /// The barrier orchestrator: walks the plan; every `Req` step streams ONE
 /// request from EVERY worker in parallel and WAITS for all of them before
-/// the next step begins. `Marker` steps (test Sections) only rename the
-/// phase. This guarantees that at any instant all workers execute the same
-/// shape, so per-step analysis is phase-aligned — no drift between workers.
+/// the next step begins. `Marker` steps (test Sections) rename the phase and
+/// — when marked "reset" — clear every worker's conversation, mirroring the
+/// single-stream runner. This guarantees that at any instant all workers
+/// execute the same shape, so per-step analysis is phase-aligned — no drift
+/// between workers.
 async fn orchestrator(st: AppState, run_id: String, session: String) {
     let plan = st.conc.take_plan(&run_id);
-    let (workers, test_title) = match st.conc.get(&run_id) {
-        Some(r) => (r.workers, r.test_title.clone()),
+    let (workers, repeats, test_title) = match st.conc.get(&run_id) {
+        Some(r) => (r.workers, r.repeats, r.test_title.clone()),
         None => return,
     };
     let stop_flag = st.conc.stop_flag(&run_id);
     let stopped =
         || stop_flag.as_ref().map(|f| f.load(Ordering::Relaxed)).unwrap_or(false);
 
+    // Per-worker conversation history (placeholder fills included — the
+    // server replaces fill-marked messages with exact corpus payloads, the
+    // same construction as the single-stream path).
+    let mut history: Vec<Vec<ChatMessage>> = vec![Vec::new(); workers];
+
     let mut req_step = 0usize;
+    // Review M2: the whole plan can repeat N times inside one run — genuine
+    // repeats for distributions. Each repetition starts from fresh worker
+    // conversations (the leading Section markers reset them anyway) and its
+    // turn labels carry "rep k/N" so every request keeps a unique identity.
+    'reps: for rep in 1..=repeats {
     for ps in &plan {
         if stopped() {
-            break;
+            break 'reps;
         }
         match ps {
-            PlanStep::Marker { title } => {
+            PlanStep::Marker { title, reset } => {
+                if *reset {
+                    for h in history.iter_mut() {
+                        h.clear();
+                    }
+                }
                 st.conc.update(&run_id, |r| r.step_title = title.clone());
             }
-            PlanStep::Req { title, fill_tokens, tg, exact_tg, temperature, reasoning_effort } => {
+            PlanStep::Req { title, prompt, fill_tokens, tg, exact_tg, temperature, reasoning_effort, stateless, expect, expect_regex } => {
                 req_step += 1;
-                let (title, fill_tokens, tg, exact_tg, temperature, reasoning_effort) =
-                    (title.clone(), *fill_tokens, *tg, *exact_tg, *temperature, reasoning_effort.clone());
+                let (title, prompt, fill_tokens, tg, exact_tg, temperature, reasoning_effort, stateless, expect, expect_regex) =
+                    (title.clone(), prompt.clone(), *fill_tokens, *tg, *exact_tg, *temperature, reasoning_effort.clone(), *stateless, expect.clone(), expect_regex.clone());
+                let title = if repeats > 1 { format!("{title} · rep {rep}/{repeats}") } else { title };
                 st.conc.update(&run_id, |r| {
                     r.step = req_step;
                     r.step_title = title.clone();
@@ -407,11 +532,29 @@ async fn orchestrator(st: AppState, run_id: String, session: String) {
                             error: None,
                             step: req_step,
                             step_title: title.clone(),
+                            assert_pass: None,
                         };
                     });
                 }
+                let step_msg = ChatMessage {
+                    role: "user".into(),
+                    content: if fill_tokens > 0 {
+                        format!("[{title} · fill {fill_tokens} tokens]")
+                    } else {
+                        prompt.clone()
+                    },
+                    images: Vec::new(),
+                    fill_tokens,
+                };
                 let mut futs = Vec::with_capacity(workers);
                 for idx in 0..workers {
+                    let msgs = if stateless {
+                        vec![step_msg.clone()]
+                    } else {
+                        let mut m = history[idx].clone();
+                        m.push(step_msg.clone());
+                        m
+                    };
                     futs.push(run_step(
                         st.clone(),
                         run_id.clone(),
@@ -419,21 +562,47 @@ async fn orchestrator(st: AppState, run_id: String, session: String) {
                         session.clone(),
                         test_title.clone(),
                         title.clone(),
-                        fill_tokens,
                         tg,
                         exact_tg,
                         temperature,
-                        Vec::new(),
-                        None,
+                        msgs,
                         reasoning_effort.clone(),
+                        expect.clone(),
+                        expect_regex.clone(),
                     ));
                 }
-                futures::future::join_all(futs).await;
+                let results = futures::future::join_all(futs).await;
+                if stopped() {
+                    break;
+                }
+                if let Some(Err(e)) = results.iter().find(|r| r.is_err()) {
+                    st.conc.update(&run_id, |r| {
+                        r.error = format!("Step '{title}' failed: {e} — test stopped.");
+                        r.finished = true;
+                    });
+                    return;
+                }
+                // Successful turns extend each worker's conversation
+                // (user step message + this worker's own assistant reply).
+                if !stateless {
+                    for (idx, res) in results.iter().enumerate() {
+                        if let Ok(reply) = res {
+                            history[idx].push(step_msg.clone());
+                            history[idx].push(ChatMessage {
+                                role: "assistant".into(),
+                                content: reply.clone(),
+                                images: Vec::new(),
+                                fill_tokens: 0,
+                            });
+                        }
+                    }
+                }
             }
-            PlanStep::Img { title, image, prompt, tg, reasoning_effort } => {
+            PlanStep::Img { title, image, prompt, tg, reasoning_effort, expect, expect_regex } => {
                 req_step += 1;
-                let (title, image, prompt, tg, reasoning_effort) =
-                    (title.clone(), image.clone(), prompt.clone(), *tg, reasoning_effort.clone());
+                let (title, image, prompt, tg, reasoning_effort, expect, expect_regex) =
+                    (title.clone(), image.clone(), prompt.clone(), *tg, reasoning_effort.clone(), expect.clone(), expect_regex.clone());
+                let title = if repeats > 1 { format!("{title} · rep {rep}/{repeats}") } else { title };
                 st.conc.update(&run_id, |r| {
                     r.step = req_step;
                     r.step_title = title.clone();
@@ -463,11 +632,21 @@ async fn orchestrator(st: AppState, run_id: String, session: String) {
                             error: None,
                             step: req_step,
                             step_title: title.clone(),
+                            assert_pass: None,
                         };
                     });
                 }
                 let mut futs = Vec::with_capacity(workers);
                 for idx in 0..workers {
+                    // Image steps replay the worker's conversation (like the
+                    // single-stream path), so later steps can refer to the image.
+                    let mut msgs = history[idx].clone();
+                    msgs.push(ChatMessage {
+                        role: "user".into(),
+                        content: prompt.clone(),
+                        images: vec![data_url.clone()],
+                        fill_tokens: 0,
+                    });
                     futs.push(run_step(
                         st.clone(),
                         run_id.clone(),
@@ -475,36 +654,57 @@ async fn orchestrator(st: AppState, run_id: String, session: String) {
                         session.clone(),
                         test_title.clone(),
                         title.clone(),
-                        0,
                         tg,
                         false,
                         None,
-                        vec![data_url.clone()],
-                        Some(prompt.clone()),
+                        msgs,
                         reasoning_effort.clone(),
+                        expect.clone(),
+                        expect_regex.clone(),
                     ));
                 }
                 let results = futures::future::join_all(futs).await;
-                if !stopped() {
-                    if let Some(Err(e)) = results.iter().find(|r| r.is_err()) {
-                        st.conc.update(&run_id, |r| {
-                            r.error = format!("Image step '{title}' failed: {e} — test stopped.");
-                            r.finished = true;
+                if stopped() {
+                    break;
+                }
+                if let Some(Err(e)) = results.iter().find(|r| r.is_err()) {
+                    st.conc.update(&run_id, |r| {
+                        r.error = format!("Image step '{title}' failed: {e} — test stopped.");
+                        r.finished = true;
+                    });
+                    return;
+                }
+                // The image turn (prompt + image, assistant reply) joins the
+                // workers' conversations.
+                let img_msg = ChatMessage {
+                    role: "user".into(),
+                    content: prompt.clone(),
+                    images: vec![data_url.clone()],
+                    fill_tokens: 0,
+                };
+                for (idx, res) in results.iter().enumerate() {
+                    if let Ok(reply) = res {
+                        history[idx].push(img_msg.clone());
+                        history[idx].push(ChatMessage {
+                            role: "assistant".into(),
+                            content: reply.clone(),
+                            images: Vec::new(),
+                            fill_tokens: 0,
                         });
-                        return;
                     }
                 }
             }
         }
     }
+    } // 'reps
     st.conc.update(&run_id, |r| r.finished = true);
 }
 
-/// One worker executes ONE plan step: builds the (exact-fill) request,
-/// streams it, records the turn into the run's shared session and keeps its
-/// snapshot updated. Returns after the step so the orchestrator's barrier
-/// can release the next one.
-#[allow(clippy::too_many_arguments)]
+/// One worker executes ONE plan step: builds the request (exact-fill
+/// construction over the full conversation, same as the ws path), streams
+/// it, records the turn into the run's shared session and keeps its
+/// snapshot updated. Returns the assistant output (joined into the
+/// worker's conversation by the orchestrator) or an error.
 #[allow(clippy::too_many_arguments)]
 async fn run_step(
     st: AppState,
@@ -513,18 +713,20 @@ async fn run_step(
     session: String,
     test_title: String,
     step_title: String,
-    fill_tokens: u32,
     tg: u32,
     exact_tg: bool,
     temperature: Option<f64>,
-    // Image (vision) step: data-URLs sent as image_url parts; the message
-    // content becomes `content_override` instead of the corpus fill.
-    images: Vec<String>,
-    content_override: Option<String>,
+    // The full request conversation: history replay (placeholder fills
+    // included) plus this step's message. The server replaces every
+    // fill-marked message with an exact corpus payload.
+    messages: Vec<ChatMessage>,
     // Per-step reasoning override: "" inherits the model config, "off"
     // disables reasoning, anything else is the effort level.
     reasoning_effort: String,
-) -> Result<(), String> {
+    // Result assertions (review M1): expected substring / regex.
+    expect: String,
+    expect_regex: String,
+) -> Result<String, String> {
     let (provider_id, model, model_uid, section, turn_label) = {
         let run = match st.conc.get(&run_id) {
             Some(r) => r,
@@ -535,14 +737,19 @@ async fn run_step(
             run.model.clone(),
             run.model_uid.clone(),
             format!("worker {}", idx + 1),
+            // The RUN label (user name, defaults to the test title) leads the
+            // turn label so a named run is findable under that name in
+            // Sessions, reports and search — not renamed by its first step
+            // (review F6).
             if run.test_id.is_empty() {
                 run.label.clone()
             } else {
-                format!("{test_title} · {step_title}")
+                format!("{} · {}", run.label, step_title)
             },
         )
     };
     let label = turn_label;
+    let request_id = format!("{run_id}-w{}-{}", idx + 1, crate::settings::short_id());
 
     let settings = st.store.settings().await;
     let Some(provider) = settings
@@ -585,23 +792,15 @@ async fn run_step(
             .map(Arc::new),
     };
 
-    // Build the request: ONE user message with an exact corpus fill
-    // (context depth + measured prompt in a single request)
-    // and a fixed generation budget.
+    // Build the request: the step's conversation with a fixed generation
+    // budget override — ONLY when the plan carries one (tg > 0). An unset
+    // budget must inherit the provider/model default, never collapse to a
+    // 1-token budget.
     let request = ChatRequest {
         provider_id: provider_id.clone(),
         model: model.clone(),
         model_uid: model_uid.clone(),
-        messages: vec![ChatMessage {
-            role: "user".into(),
-            content: if images.is_empty() {
-                format!("[{step_title} · fill {fill_tokens} tokens]")
-            } else {
-                content_override.clone().unwrap_or_else(|| "Please describe this image.".into())
-            },
-            images: images.clone(),
-            fill_tokens: if images.is_empty() { fill_tokens } else { 0 },
-        }],
+        messages,
         reasoning_enabled: {
             let cfg_on = model_cfg.as_ref().map(|m| m.reasoning_enabled).unwrap_or(false);
             match reasoning_effort.as_str() {
@@ -619,14 +818,17 @@ async fn run_step(
             v => v.to_string(),
         },
         overrides: {
-            let mut ov = vec![ParamOverride {
-                key: "max_tokens".into(),
-                value: tg.to_string(),
-            }];
-            if exact_tg {
-                // exact-tg mode: never stop early.
-                ov.push(ParamOverride { key: "min_tokens".into(), value: tg.to_string() });
-                ov.push(ParamOverride { key: "ignore_eos".into(), value: "true".into() });
+            let mut ov = Vec::new();
+            if tg > 0 {
+                ov.push(ParamOverride {
+                    key: "max_tokens".into(),
+                    value: tg.to_string(),
+                });
+                if exact_tg {
+                    // exact-tg mode: never stop early.
+                    ov.push(ParamOverride { key: "min_tokens".into(), value: tg.to_string() });
+                    ov.push(ParamOverride { key: "ignore_eos".into(), value: "true".into() });
+                }
             }
             if let Some(t) = temperature {
                 ov.push(ParamOverride { key: "temperature".into(), value: t.to_string() });
@@ -634,8 +836,9 @@ async fn run_step(
             ov
         },
         max_stats_tokens: 0.0,
-        // Steps are independent shapes: never replay a previous step's
-        // history on top of the next one.
+        // Each step is a NEW server-side request, but the conversation is
+        // carried in the messages (history replay) — no provider session
+        // continuity is needed or wanted across steps.
         reset_session: true,
         reset_stats: false,
         kind: "concurrent".into(),
@@ -644,6 +847,10 @@ async fn run_step(
         section: section.clone(),
         regimes_from_sections: true,
         fill_tokens: 0,
+        request_id,
+        resume: false,
+        expect: expect.clone(),
+        expect_regex: expect_regex.clone(),
     };
 
     // Exact-by-construction fill (same as the ws path).
@@ -695,18 +902,26 @@ async fn run_step(
                 w.state = "failed".into();
                 w.error = Some(format!("stream failed: {e}"));
             });
-            mark_finished_if_settled(&st, &run_id);
             return Err(format!("stream failed: {e}"));
         }
     };
     let mut buf = String::new();
     let mut stream = res.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        if let Some(f) = &stop_flag {
-            if f.load(Ordering::Relaxed) {
-                break;
+    // Stop must win even when the provider stream stalls: the stop flag is
+    // checked on a short timer, not only between chunks.
+    loop {
+        let next = tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                if let Some(f) = &stop_flag {
+                    if f.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                continue;
             }
-        }
+            c = stream.next() => c,
+        };
+        let Some(chunk) = next else { break };
         let chunk = match chunk {
             Ok(b) => b,
             Err(_) => break,
@@ -725,6 +940,9 @@ async fn run_step(
                     continue;
                 }
                 if let Some(p) = crate::ws::parse_delta(data) {
+                    if let Some(r) = &p.finish_reason {
+                        engine.set_finish_reason(r);
+                    }
                     let ts = now_ms();
                     if !p.content.is_empty() {
                         engine.record_delta("content", &p.content, ts);
@@ -752,11 +970,10 @@ async fn run_step(
     let stopped = stop_flag
         .map(|f| f.load(Ordering::Relaxed))
         .unwrap_or(false);
-    if stopped {
-        mark_finished_if_settled(&st, &run_id);
-        return Ok(());
-    }
 
+    // Finalise — including a Stop: the partial output is recorded with its
+    // cancelled state so the report shows what actually happened (a stopped
+    // run is data, not a silent gap).
     let gen = engine.finish_exact(&st.http, handle.as_deref(), now_ms()).await;
     let final_tok_s = Some(gen.final_tok_s);
     let completion = gen.completion_tokens;
@@ -771,13 +988,29 @@ async fn run_step(
         &stream_req,
         model_cfg.as_ref(),
         handle.as_ref(),
-        out,
+        out.clone(),
         reasoning,
         category,
         session,
         gen,
+        stopped,
     )
     .await;
+
+    let assertion = crate::ws::judge_assertion(&expect, &expect_regex, &out);
+    let assert_pass = assertion.map(|a| a.pass);
+    if stopped {
+        set_worker(&st, &run_id, idx, |w| {
+            w.state = "stopped".into();
+            w.completion_tokens = completion;
+            w.final_tok_s = final_tok_s;
+            w.ttft_ms = ttft;
+            w.tok_s = final_tok_s.unwrap_or(0.0);
+            w.est_tokens = completion as f64;
+            w.assert_pass = assert_pass;
+        });
+        return Ok(String::new());
+    }
 
     set_worker(&st, &run_id, idx, |w| {
         w.state = "done".into();
@@ -786,22 +1019,135 @@ async fn run_step(
         w.ttft_ms = ttft;
         w.tok_s = final_tok_s.unwrap_or(0.0);
         w.est_tokens = completion as f64;
+        w.assert_pass = assert_pass;
     });
-    mark_finished_if_settled(&st, &run_id);
-    Ok(())
+    Ok(out)
 }
 
-fn mark_finished_if_settled(st: &AppState, run_id: &str) {
-    let all_done = st
-        .conc
-        .get(run_id)
-        .map(|r| {
-            r.snaps
-                .iter()
-                .all(|w| matches!(w.state.as_str(), "done" | "failed" | "stopped"))
-        })
-        .unwrap_or(false);
-    if all_done {
-        st.conc.update(run_id, |r| r.finished = true);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::{TestDef, TestStep};
+
+    fn step(kind: &str, title: &str, text: &str, tg: u32) -> TestStep {
+        TestStep {
+            kind: kind.into(),
+            title: title.into(),
+            text: text.into(),
+            k: 0,
+            depth: 0,
+            pp: 0,
+            tg,
+            exact_tg: false,
+            image: String::new(),
+            prompt: String::new(),
+            reasoning_effort: String::new(),
+            expect: String::new(),
+            expect_regex: String::new(),
+            reset: kind == "section",
+        }
+    }
+
+    fn test(max_tokens: Option<u64>, steps: Vec<TestStep>) -> TestDef {
+        TestDef {
+            id: "t".into(),
+            title: "T".into(),
+            description: String::new(),
+            temperature: None,
+            max_tokens,
+            regimes_from_sections: false,
+            prebuilt: false,
+            favorite: false,
+            created_at: String::new(),
+            steps,
+        }
+    }
+
+    /// F1 regression: a prompt step keeps its real prompt text and an unset
+    /// budget (tg = 0, no test max_tokens) stays 0 = "no override" — never a
+    /// 1-token budget.
+    #[test]
+    fn prompt_steps_carry_text_and_unset_budget_stays_unset() {
+        let t = test(
+            None,
+            vec![
+                step("section", "Arithmetic", "", 0),
+                step("prompt", "", "What is 2+2? Answer with just the number.", 0),
+            ],
+        );
+        let plan = plan_from_test(&t);
+        assert_eq!(plan.len(), 2);
+        match &plan[1] {
+            PlanStep::Req { prompt, tg, .. } => {
+                assert_eq!(prompt, "What is 2+2? Answer with just the number.");
+                assert_eq!(*tg, 0, "unset budget must stay unset (provider default)");
+            }
+            other => panic!("expected Req, got {other:?}"),
+        }
+    }
+
+    /// Budget inheritance mirrors the single-stream runner: step tg wins,
+    /// then the test-level max_tokens.
+    #[test]
+    fn budget_inherits_test_max_tokens() {
+        let t = test(
+            Some(2048),
+            vec![
+                step("section", "s", "", 0),
+                step("prompt", "", "a", 0),
+                step("prompt", "", "b", 128),
+            ],
+        );
+        let plan = plan_from_test(&t);
+        match (&plan[1], &plan[2]) {
+            (PlanStep::Req { tg: a, .. }, PlanStep::Req { tg: b, .. }) => {
+                assert_eq!(*a, 2048, "step without tg inherits test max_tokens");
+                assert_eq!(*b, 128, "explicit step tg wins over test max_tokens");
+            }
+            other => panic!("expected Req steps, got {other:?}"),
+        }
+    }
+
+    /// A1 enabler: executable steps in one phase get distinct titles, so the
+    /// report can tell the barrier steps (and their requests) apart.
+    #[test]
+    fn multi_step_phases_get_distinct_titles() {
+        let t = test(
+            None,
+            vec![
+                step("section", "Arithmetic", "", 0),
+                step("prompt", "", "2+2", 0),
+                step("prompt", "", "12*7", 0),
+                step("section", "Reasoning", "", 0),
+                step("prompt", "", "bat and ball", 0),
+            ],
+        );
+        let plan = plan_from_test(&t);
+        let titles: Vec<String> = plan
+            .iter()
+            .filter_map(|p| match p {
+                PlanStep::Req { title, .. } => Some(title.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(titles, vec!["Arithmetic · 1", "Arithmetic · 2", "Reasoning"]);
+    }
+
+    /// Reset sections clear worker conversations (single-stream parity).
+    #[test]
+    fn section_reset_flag_is_carried() {
+        let mut s = step("section", "s", "", 0);
+        s.reset = true;
+        let mut s2 = step("section", "s2", "", 0);
+        s2.reset = false;
+        let t = test(None, vec![s, step("prompt", "", "a", 0), s2, step("prompt", "", "b", 0)]);
+        let plan = plan_from_test(&t);
+        match (&plan[0], &plan[2]) {
+            (PlanStep::Marker { reset: r1, .. }, PlanStep::Marker { reset: r2, .. }) => {
+                assert!(r1);
+                assert!(!r2);
+            }
+            other => panic!("expected Markers, got {other:?}"),
+        }
     }
 }

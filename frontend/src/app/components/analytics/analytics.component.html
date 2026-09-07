@@ -39,10 +39,26 @@
         </select>
       </div>
       <div class="rc-group rc-right">
-        <button class="btn" (click)="exportPNG()" title="Export the whole analytics page as a PNG">PNG</button>
-        <button class="btn" (click)="exportPDF()" title="Export the whole analytics page as a PDF">PDF</button>
+        <button class="btn" (click)="exportPNG()" title="Export the whole report as one PNG image (full dashboard)">PNG</button>
+        <button class="btn" (click)="exportPDF()" title="Export as a paginated PDF with selectable text (opens the browser's Save-as-PDF dialog)">PDF</button>
+        <button class="btn" (click)="exportCSV()" title="Download request-level metrics as CSV (one row per request)">CSV</button>
+        <button class="btn" (click)="exportJSON()" title="Download the full per-request analysis payload as JSON (reproducibility — no credentials)">JSON</button>
       </div>
     </div>
+    @if (exportNote()) {
+      <div class="export-note mono small">{{ exportNote() }}</div>
+    }
+
+    <!-- Screen-reader metric summary (review U5): the key report numbers
+       readable without interpreting any chart. -->
+    @if (detail(); as ds) {
+      <p class="sr-only">
+        Report summary: {{ ds.turns.length }} request(s), {{ fmtInt(deck().totalTokens) }} generated tokens,
+        median decode {{ headline().medRate == null ? 'insufficient data' : fmt1n(headline().medRate) + ' tok/s' }},
+        first token {{ headline().ttftP50 == null ? 'unavailable' : fmtS(headline().ttftP50) }},
+        {{ fmtPct(deck().reasoningShare, 0) }} of tokens went to reasoning.
+      </p>
+    }
 
     <!-- §3.1 run header -->
     <header class="run-header">
@@ -111,12 +127,20 @@
           <div class="conc-banner">
             <div class="conc-main">
               <span class="conc-bolt">⚡</span>
-              <span class="conc-agg num">{{ cc.agg == null ? '—' : fmt1n(cc.agg) }}</span>
-              <span class="conc-unit">tok/s aggregate · Σ sustained worker streams</span>
+              @if (cc.agg != null) {
+                <span class="conc-agg num">{{ fmt1n(cc.agg) }}</span>
+                <span class="conc-unit">tok/s aggregate sustained · Σ of workers' sustained rates per step, averaged across steps</span>
+              } @else {
+                <span class="conc-agg num">—</span>
+                <span class="conc-unit">aggregate sustained rate: insufficient data (workers with fewer than 2 tokens have no measurable rate)</span>
+              }
             </div>
             <div class="conc-side num">
-              <span><b>{{ cc.workers }}</b> workers</span>
-              <span title="Total tokens ÷ longest worker — includes ramp-in (TTFT) and staggered finishes, so it sits below the sustained rate on short runs.">end-to-end Σ÷wall <b>{{ cc.wallAgg == null ? '—' : fmt1n(cc.wallAgg) }}</b> tok/s</span>
+              <span><b>{{ cc.workers }}</b> workers · <b>{{ cc.steps }}</b> steps · <b>{{ cc.requests }}</b> requests</span>
+              @if (cc.insufficientRequests > 0) {
+                <span class="strong" style="color:#fbbf24">⚠ {{ cc.insufficientRequests }} request{{ cc.insufficientRequests === 1 ? '' : 's' }} with too little output to measure</span>
+              }
+              <span title="Total tokens ÷ true wall time (first request start → last request end) — includes ramp-in (TTFT), step barriers and staggered finishes.">end-to-end Σ÷wall <b>{{ cc.wallAgg == null ? '—' : fmt1n(cc.wallAgg) }}</b> tok/s</span>
               <span>mean worker <b>{{ cc.meanWorker == null ? '—' : fmt1n(cc.meanWorker) }}</b> tok/s</span>
               <span>Σ <b>{{ fmtInt(cc.totalTokens) }}</b> tok in <b>{{ fmtDur(cc.wallMs) }}</b></span>
               <span>avg TTFT <b>{{ cc.ttftAvg == null ? '—' : fmtMs(cc.ttftAvg) }}</b></span>
@@ -125,10 +149,14 @@
           </div>
         }
         <div class="perf-chips num">
-          <span class="perf-chip">⏱ Runtime <b>{{ deck().genMs ? fmtDur(deck().genMs) : '—' }}</b></span>
+          @if (conc(); as ccR) {
+            <span class="perf-chip">⏱ Runtime <b>{{ fmtDur(ccR.wallMs) }}</b></span>
+          } @else {
+            <span class="perf-chip">⏱ Runtime <b>{{ deck().genMs ? fmtDur(deck().genMs) : '—' }}</b></span>
+          }
           <span class="perf-chip">🔁 Turns <b>{{ deck().turns }}</b></span>
           <span class="perf-chip">📦 Total tokens <b>{{ fmtInt(deck().totalTokens) }}</b></span>
-          <span class="perf-chip">⚡ Avg overall rate <b>{{ perf().overallRate == null ? '—' : '≈ ' + fmt1n(perf().overallRate) + ' tok/s' }}</b></span>
+          <span class="perf-chip" [title]="conc() ? 'Total tokens ÷ true wall time of the whole run (all steps + barriers)' : 'Total tokens ÷ total decode time'">⚡ {{ conc() ? 'End-to-end rate (Σ÷wall)' : 'Avg overall rate' }} <b>{{ perf().overallRate == null ? '—' : '≈ ' + fmt1n(perf().overallRate) + ' tok/s' }}</b></span>
         </div>
         <div class="perf-grid perf-g5 perf-g5compact">
           <div class="perf-card">
@@ -143,7 +171,12 @@
             <span class="perf-pill" [class]="'perf-pill ' + perfPillTtft().cls">{{ perfPillTtft().label }}</span>
             <div class="perf-label">First token</div>
             <div class="perf-value num">{{ headline().ttftP50 == null ? '—' : fmtS(headline().ttftP50) }}</div>
-            <div class="perf-sub num">P95 {{ fmtMs(deck().ttftP95) }} · P99 {{ fmtMs(deck().ttftP99) }}</div>
+            <div class="perf-sub num">
+              @if (headline().ttfoP50 != null) {
+                <span title="Time to the first VISIBLE output token (after reasoning) — for reasoning models this is when the answer actually starts.">first visible output {{ fmtS(headline().ttfoP50!) }}</span> ·
+              }
+              P95 {{ fmtMs(deck().ttftP95) }} · P99 {{ fmtMs(deck().ttftP99) }}
+            </div>
           </div>
           <div class="perf-card">
             <div class="perf-accent amber"></div>
@@ -175,7 +208,7 @@
           <div class="perf-stat"><div class="perf-k">Total tokens</div><div class="perf-v">{{ fmtInt(deck().totalTokens) }}</div></div>
           <div class="perf-stat"><div class="perf-k">Tokens / request {{ deck().avgMode ? '(avg)' : '(P50)' }}</div><div class="perf-v">{{ fmtInt(deck().tokMed) }}</div></div>
           <div class="perf-stat"><div class="perf-k">TPOT {{ deck().avgMode ? '(avg)' : '(P50)' }}</div><div class="perf-v">{{ fmtMsPrec(deck().tpot) }}</div></div>
-          <div class="perf-stat"><div class="perf-k">Prefill tok/s</div><div class="perf-v">{{ deck().prefill == null ? '—' : '≈ ' + fmt1n(deck().prefill) }}</div></div>
+          <div class="perf-stat"><div class="perf-k" title="prompt tokens ÷ TTFT — an end-to-end estimate, not a measured server prefill rate">Prompt tok/s (TTFT est.)</div><div class="perf-v">{{ deck().prefill == null ? '—' : '≈ ' + fmt1n(deck().prefill) }}</div></div>
           <div class="perf-stat"><div class="perf-k">Volatility (MAD/med)</div><div class="perf-v">{{ fmtPct(deck().volatility, 1) }}</div></div>
         </div>
       </div>
@@ -184,9 +217,9 @@
 @if (conc()) {
             @for (g of turnGroups(); track g.name) {
               <div class="card turntable-card">
-                <div class="chart-head"><h4>{{ g.name }}</h4><span class="chart-unit">barrier step · {{ g.rows.length }} worker turn(s) · Σ / avg = step total</span></div>
+                <div class="chart-head"><h4>{{ g.name }}</h4><span class="chart-unit">barrier step · one request per worker ({{ g.rows.length }}) · Σ / avg = step total</span></div>
                 <table class="ttable">
-                  <thead><tr><th>Worker</th><th class="num">Input tok</th><th>Output tok</th><th>Total tok</th><th>TTFT</th><th>Prefill tok/s</th><th class="num">Med tok/s</th><th class="num">Med tok/s (aggr.)</th><th class="num">Min</th><th class="num">Max</th><th class="num">α̂ avg</th><th class="num">Depth avg</th></tr></thead>
+                  <thead><tr><th>Worker</th><th class="num">Input tok</th><th>Output tok</th><th>Total tok</th><th>TTFT</th><th title="prompt tokens ÷ TTFT — an end-to-end estimate, not a measured server prefill rate">Prompt tok/s (TTFT est.)</th><th class="num">Med tok/s</th><th class="num">Med tok/s (aggr.)</th><th class="num">Min</th><th class="num">Max</th><th class="num">α̂ avg</th><th class="num">Depth avg</th></tr></thead>
                   <tbody>
                     @if (g.agg; as ga) {
                       <tr class="agg-row">
@@ -212,7 +245,7 @@
         <div class="card turntable-card">
           <div class="chart-head"><h4>Per-turn timings</h4><span class="chart-unit">sent = tokens the model received for that turn (incl. conversation history)</span></div>
           <table class="ttable">
-            <thead><tr><th>Turn</th>@if (sectionMode()) {<th>Section</th>}<th class="num">Input tok</th><th>Output tok</th><th>Total tok</th><th>TTFT</th><th>Prefill tok/s</th><th class="num">Med tok/s</th><th class="num">Min</th><th class="num">Max</th><th class="num">α̂ avg</th><th class="num">Depth avg</th></tr></thead>
+            <thead><tr><th>Turn</th>@if (sectionMode()) {<th>Section</th>}<th class="num">Input tok</th><th>Output tok</th><th>Total tok</th><th>TTFT</th><th title="prompt tokens ÷ TTFT — an end-to-end estimate, not a measured server prefill rate">Prompt tok/s (TTFT est.)</th><th class="num">Med tok/s</th><th class="num">Min</th><th class="num">Max</th><th class="num">α̂ avg</th><th class="num">Depth avg</th></tr></thead>
             <tbody>
               @for (r of turnRows(); track r.n) {
                 <tr>
@@ -262,16 +295,16 @@
       @if (conc(); as ccT) {
         <div class="chart-card card">
           <div class="chart-head">
-            <h4>Decode rate timeline — workers + Σ</h4>
-            <span class="chart-unit">tok/s · shared t=0 · Σ median {{ ccT.sumMed == null ? '—' : fmt1n(ccT.sumMed) }} · min {{ ccT.sumMin == null ? '—' : fmt1n(ccT.sumMin) }} · max {{ ccT.sumMax == null ? '—' : fmt1n(ccT.sumMax) }}</span>
+            <h4>Decode rate timeline — requests + Σ</h4>
+            <span class="chart-unit">tok/s · true request times · Σ median {{ ccT.sumMed == null ? '—' : fmt1n(ccT.sumMed) }} · min {{ ccT.sumMin == null ? '—' : fmt1n(ccT.sumMin) }} · max {{ ccT.sumMax == null ? '—' : fmt1n(ccT.sumMax) }}</span>
           </div>
           <canvas #cvConc id="cvConc" class="chart hero-chart"></canvas>
           <div class="legend-row">
-            <span class="key"><span class="dot" style="background:#e8ecf4"></span><b>Σ of workers (200 ms bins)</b></span>
+            <span class="key"><span class="dot" style="background:#e8ecf4"></span><b>Σ of requests (200 ms bins)</b></span>
             <span class="key muted">— — Σ median {{ ccT.sumMed == null ? '—' : fmt1n(ccT.sumMed) }} tok/s</span>
-            <span class="key muted">thin colored lines = individual workers</span>
+            <span class="key muted">thin colored lines = individual requests</span>
           </div>
-          <div class="muted small">Every worker drawn over the same timeframe (all started together); the Σ series sums all workers' tokens per 200 ms bin. Median, min and max of the Σ line are the report's headline numbers.</div>
+          <div class="muted small">Every request is placed at its TRUE start time on the run's timeline (steps are sequential per worker, so requests do not all start together); the Σ series sums all requests' tokens per 200 ms bin. Median, min and max of the Σ line are the report's headline numbers.</div>
         </div>
       } @else {
         <div class="chart-card card">
@@ -366,37 +399,41 @@
           <div class="perf-eyebrow">Inference Telemetry · Session Report</div>
           <h1 class="perf-h1">Generation Performance</h1>
           <p class="perf-summary">
-            A <strong class="num">{{ perf().d.genMs ? fmtDur(perf().d.genMs) : '—' }}</strong> session that produced
+            A <strong class="num">{{ conc() ? fmtDur(conc()!.wallMs) : (perf().d.genMs ? fmtDur(perf().d.genMs) : '—') }}</strong> session that produced
             <strong class="num">{{ fmtInt(perf().d.totalTokens) }}</strong> tokens across
-            <strong class="num">{{ perf().d.turns }}</strong> turn{{ perf().d.turns === 1 ? '' : 's' }}.
+            <strong class="num">{{ perf().d.turns }}</strong> {{ conc() ? 'request' : 'turn' }}{{ perf().d.turns === 1 ? '' : 's' }}.
             Streaming held <strong class="num">{{ fmtPct(headline().stability) }}</strong> of peak throughput with a
             <strong class="num">{{ headline().ttftP50 == null ? '—' : fmtS(headline().ttftP50) }}</strong> first-token response —
             and <strong class="num">{{ fmtPct(perf().d.reasoningShare, 0) }}</strong> of tokens went to internal reasoning.
           </p>
           <div class="perf-chips num">
-            <span class="perf-chip">⏱ Runtime <b>{{ perf().d.genMs ? fmtDur(perf().d.genMs) : '—' }}</b></span>
+            @if (conc(); as ccR2) {
+              <span class="perf-chip">⏱ Runtime <b>{{ fmtDur(ccR2.wallMs) }}</b></span>
+            } @else {
+              <span class="perf-chip">⏱ Runtime <b>{{ perf().d.genMs ? fmtDur(perf().d.genMs) : '—' }}</b></span>
+            }
             <span class="perf-chip">🔁 Turns <b>{{ perf().d.turns }}</b></span>
             <span class="perf-chip">📦 Total tokens <b>{{ fmtInt(perf().d.totalTokens) }}</b></span>
-            <span class="perf-chip">⚡ Avg overall rate <b>{{ perf().overallRate == null ? '—' : '≈ ' + fmt1n(perf().overallRate) + ' tok/s' }}</b></span>
+            <span class="perf-chip" [title]="conc() ? 'Total tokens ÷ true wall time of the whole run (all steps + barriers)' : 'Total tokens ÷ total decode time'">⚡ {{ conc() ? 'End-to-end rate (Σ÷wall)' : 'Avg overall rate' }} <b>{{ perf().overallRate == null ? '—' : '≈ ' + fmt1n(perf().overallRate) + ' tok/s' }}</b></span>
           </div>
         </header>
 
-        <!-- Concurrent: decode timeline of ALL workers + Σ over shared t=0 -->
+        <!-- Concurrent: decode timeline of ALL requests + Σ over true start times -->
         @if (conc(); as cc0) {
           <section class="perf-sec">
-            <div class="perf-sechead"><h2>Decode Rate Timeline — Workers + Σ</h2><div class="perf-rule"></div></div>
+            <div class="perf-sechead"><h2>Decode Rate Timeline — Requests + Σ</h2><div class="perf-rule"></div></div>
             <div class="chart-card card">
               <div class="chart-head">
-                <h3>Parallel decode — {{ cc0.workers }} workers + SUM</h3>
-                <span class="chart-unit">tok/s · shared t=0 · Σ median {{ cc0.sumMed == null ? '—' : fmt1n(cc0.sumMed) }} · min {{ cc0.sumMin == null ? '—' : fmt1n(cc0.sumMin) }} · max {{ cc0.sumMax == null ? '—' : fmt1n(cc0.sumMax) }}</span>
+                <h3>Parallel decode — {{ cc0.workers }} workers · {{ cc0.steps }} steps · {{ cc0.requests }} requests + Σ</h3>
+                <span class="chart-unit">tok/s · true request times · Σ median {{ cc0.sumMed == null ? '—' : fmt1n(cc0.sumMed) }} · min {{ cc0.sumMin == null ? '—' : fmt1n(cc0.sumMin) }} · max {{ cc0.sumMax == null ? '—' : fmt1n(cc0.sumMax) }}</span>
               </div>
               <canvas #cvConc id="cvConc" class="chart hero-chart"></canvas>
               <div class="legend-row">
-                <span class="key"><span class="dot" style="background:#e8ecf4"></span><b>Σ of workers (200 ms bins)</b></span>
+                <span class="key"><span class="dot" style="background:#e8ecf4"></span><b>Σ of requests (200 ms bins)</b></span>
                 <span class="key muted">— — Σ median {{ cc0.sumMed == null ? '—' : fmt1n(cc0.sumMed) }} tok/s</span>
-                <span class="key muted">thin colored lines = individual workers</span>
+                <span class="key muted">thin colored lines = individual requests</span>
               </div>
-              <div class="muted small">Every worker drawn over the same timeframe (all started together); the Σ series sums all workers' tokens per 200 ms bin. Median, min and max of the Σ line are the report's headline numbers.</div>
+              <div class="muted small">Every request is placed at its TRUE start time on the run's timeline (steps are sequential per worker, so requests do not all start together); the Σ series sums all requests' tokens per 200 ms bin. Median, min and max of the Σ line are the report's headline numbers.</div>
               <table class="rate-table">
                 <thead>
                   <tr>
@@ -411,7 +448,7 @@
                 <tbody>
                   @for (r of rateTable(); track r.label) {
                     <tr [class.head-row]="r.label === 'All (Σ)'">
-                      <td>{{ r.label }}</td>
+                      <td>{{ r.label === 'All (Σ)' ? r.label : regimeLabel(r.label) }}</td>
                       <td class="num">{{ r.med == null ? '—' : fmt1(r.med) }}</td>
                       <td class="num">{{ r.min == null ? '—' : fmt1(r.min) }}</td>
                       <td class="num">{{ r.max == null ? '—' : fmt1(r.max) }}</td>
@@ -451,7 +488,14 @@
               <span class="perf-pill" [class]="'perf-pill ' + perfPillTtft().cls">{{ perfPillTtft().label }}</span>
               <div class="perf-label"><span data-tip="Time to first token (TTFT) — how long until generation visibly starts.">First token</span></div>
               <div class="perf-value num">@if (conc(); as cc2) { {{ cc2.ttftAvg == null ? '—' : fmtS(cc2.ttftAvg!) }} } @else { {{ headline().ttftP50 == null ? '—' : fmtS(headline().ttftP50) }} }</div>
-              <div class="perf-sub num">@if (conc()) {avg across workers} @else {P95 {{ fmtMs(perf().d.ttftP95) }} · P99 {{ fmtMs(perf().d.ttftP99) }}}</div>
+              <div class="perf-sub num">
+                @if (conc()) {avg across workers} @else {
+                  @if (headline().ttfoP50 != null) {
+                    <span title="Time to the first VISIBLE output token (after reasoning) — for reasoning models this is when the answer actually starts.">first visible output {{ fmtS(headline().ttfoP50!) }}</span> ·
+                  }
+                  P95 {{ fmtMs(perf().d.ttftP95) }} · P99 {{ fmtMs(perf().d.ttftP99) }}
+                }
+              </div>
             </div>
             <div class="perf-card">
               <div class="perf-accent green"></div>
@@ -504,12 +548,18 @@
               <div class="perf-stat"><div class="perf-k">Output rate</div><div class="perf-v">{{ perf().outputRate == null ? '—' : '≈ ' + fmt1n(perf().outputRate) + ' tok/s' }}</div></div>
               <div class="perf-stat"><div class="perf-k">Overall rate</div><div class="perf-v">{{ perf().overallRate == null ? '—' : '≈ ' + fmt1n(perf().overallRate) + ' tok/s' }}</div></div>
             </div>
-            @if (perf().d.reasoningShare != null) {
-              <div class="perf-insight">
-                <span class="perf-iicon">◆</span>
-                <span><b>{{ fmtPct(perf().d.reasoningShare, 0) }} of compute went to reasoning.</b>
-                For every visible token, ~{{ fmtTimes(1 / (1 - perf().d.reasoningShare!) - 1) }} thinking token(s) were generated — typical for reasoning-heavy models on complex turns.</span>
-              </div>
+            @if (perf().d.reasoningShare; as rs) {
+              @if (rs > 0) {
+                <div class="perf-insight">
+                  <span class="perf-iicon">◆</span>
+                  <span><b>{{ fmtPct(rs, 0) }} of generated tokens went to reasoning (token share, not compute share).</b>
+                  @if (perf().d.thinkingPerOutput != null) {
+                    For every visible output token, ~{{ fmtTimes(perf().d.thinkingPerOutput) }} thinking token(s) were generated.
+                  } @else if (perf().d.allReasoningNoOutput) {
+                    No visible output was produced — every generated token went to reasoning, so there is no thinking-to-output ratio.
+                  }</span>
+                </div>
+              }
             }
           </div>
         </section>
@@ -621,7 +671,7 @@
               </div>
               <div class="perf-axisnote" style="margin-top:8px">averages across the parallel workers</div>
               <div class="perf-ministats perf-minis2 num">
-                <div class="perf-mini"><span class="perf-k">Prefill tok/s</span><span class="perf-v">{{ perf().d.promptPresent ? '≈ ' + fmt1n(cc5.prefillAvg) : '—' }}</span></div>
+                <div class="perf-mini"><span class="perf-k" title="prompt tokens ÷ TTFT — an end-to-end estimate, not a measured server prefill rate">Prompt tok/s (TTFT est.)</span><span class="perf-v">{{ perf().d.promptPresent ? '≈ ' + fmt1n(cc5.prefillAvg) : '—' }}</span></div>
                 <div class="perf-mini"><span class="perf-k">Tok / request (avg)</span><span class="perf-v">{{ fmtInt(deck().tokMed) }}</span></div>
               </div>
               } @else {
@@ -634,7 +684,7 @@
               <div class="perf-ministats perf-minis2 num">
                 <div class="perf-mini"><span class="perf-k"><span data-tip="Time to start of streaming (TTST) — when the first bytes begin flowing.">TTST (P50)</span></span><span class="perf-v">{{ fmtMsPrec(perf().d.ttst) }}</span></div>
                 <div class="perf-mini"><span class="perf-k"><span data-tip="Time to first output (TTFO) — until the first meaningful output chunk, after reasoning begins.">TTFO (P50)</span></span><span class="perf-v">{{ fmtMsPrec(perf().d.ttfo) }}</span></div>
-                <div class="perf-mini"><span class="perf-k">Prefill tok/s</span><span class="perf-v">{{ perf().d.promptPresent ? fmt1n(perf().d.prefill) : '—' }}</span></div>
+                <div class="perf-mini"><span class="perf-k" title="prompt tokens ÷ TTFT — an end-to-end estimate, not a measured server prefill rate">Prompt tok/s (TTFT est.)</span><span class="perf-v">{{ perf().d.promptPresent ? fmt1n(perf().d.prefill) : '—' }}</span></div>
                 <div class="perf-mini"><span class="perf-k">Tok / request (P50)</span><span class="perf-v">{{ fmtInt(perf().d.tokMed) }}</span></div>
               </div>
               }
@@ -651,7 +701,7 @@
               <span class="perf-pill" [class]="'perf-pill ' + perfPillVariance().cls">{{ perfPillVariance().label }}</span>
               <div class="perf-label">Run variance</div>
               <div class="perf-value num">{{ perf().d.runCvPct == null ? '—' : fmtPct(perf().d.runCvPct, 1) }}</div>
-              <div class="perf-sub">session-to-session spread · needs ≥2 turns ({{ perf().d.turns }} recorded)</div>
+              <div class="perf-sub" title="Variation of per-turn final rates WITHIN this session — different prompts, not independent repeated benchmark sessions">turn-to-turn spread · needs ≥2 turns ({{ perf().d.turns }} recorded)</div>
             </div>
             <div class="perf-card">
               <div class="perf-label">Reasoning share</div>
@@ -700,15 +750,22 @@
 @if (conc()) {
             @for (g of turnGroups(); track g.name) {
               <div class="card turntable-card">
-                <div class="chart-head"><h4>{{ g.name }}</h4><span class="chart-unit">barrier step · {{ g.rows.length }} worker turn(s) · Σ / avg = step total</span></div>
+                <div class="chart-head"><h4>{{ g.name }}</h4><span class="chart-unit">barrier step · one request per worker ({{ g.rows.length }}) · Σ / avg = step total</span></div>
                 <table class="ttable">
-                  <thead><tr><th>Worker</th><th class="num">Input tok</th><th>Output tok</th><th>Total tok</th><th>TTFT</th><th>Prefill tok/s</th><th class="num">Med tok/s</th><th class="num">Med tok/s (aggr.)</th><th class="num">Min</th><th class="num">Max</th><th class="num">α̂ avg</th><th class="num">Depth avg</th></tr></thead>
+                  <thead><tr><th>Worker</th><th class="num">Input tok</th><th>Output tok</th><th>Total tok</th><th>TTFT</th><th title="prompt tokens ÷ TTFT — an end-to-end estimate, not a measured server prefill rate">Prompt tok/s (TTFT est.)</th><th class="num">Med tok/s</th><th class="num">Med tok/s (aggr.)</th><th class="num">Min</th><th class="num">Max</th><th class="num">α̂ avg</th><th class="num">Depth avg</th></tr></thead>
                   <tbody>
                     @for (r of g.rows; track r.n) {
                       <tr>
-                        <td class="mono">{{ r.section ?? '—' }}</td>
+                        <td class="mono">{{ r.section ?? '—' }}@if (r.cancelled) {<span class="turnflag warn">cancelled</span>}</td>
                         <td class="mono">{{ r.input == null ? '—' : fmtInt(r.input) }}</td>
-                        <td class="mono">{{ r.out == null ? '—' : fmtInt(r.out) }}</td>
+                        <td class="mono">
+                          {{ r.out == null ? '—' : fmtInt(r.out) }}
+                          @if (r.assertion?.pass === true) {<span class="turnflag ok" title="Answer assertion passed">PASS</span>}
+                          @if (r.assertion?.pass === false) {<span class="turnflag bad" [title]="r.assertion!.detail || 'Answer assertion failed'">FAIL</span>}
+                          @if (r.emptyOut) {<span class="turnflag bad" title="No visible output was produced — the HTTP request succeeded, but this is not a valid benchmark result">EMPTY</span>}
+                          @if (r.truncated) {<span class="turnflag warn" title="The output hit the generation budget (finish reason: length) and was cut off">TRUNCATED</span>}
+                          @if (r.insufficientRate && !r.emptyOut) {<span class="turnflag dim" title="Fewer than 2 tokens: no sustained rate can be measured">insufficient</span>}
+                        </td>
                         <td class="mono">{{ r.total == null ? '—' : fmtInt(r.total) }}</td>
                         <td class="mono">{{ r.ttft == null ? '—' : fmtMs(r.ttft) }}</td>
                         <td class="mono">{{ r.prefill == null ? '—' : fmt1n(r.prefill) }}</td>
@@ -744,7 +801,7 @@
         <div class="card turntable-card">
           <div class="chart-head"><h4>Per-turn timings</h4><span class="chart-unit">sent = tokens the model received for that turn (incl. conversation history)</span></div>
           <table class="ttable">
-            <thead><tr><th>Turn</th>@if (sectionMode()) {<th>Section</th>}<th class="num">Input tok</th><th>Output tok</th><th>Total tok</th><th>TTFT</th><th>Prefill tok/s</th><th class="num">Med tok/s</th><th class="num">Min</th><th class="num">Max</th><th class="num">α̂ avg</th><th class="num">Depth avg</th></tr></thead>
+            <thead><tr><th>Turn</th>@if (sectionMode()) {<th>Section</th>}<th class="num">Input tok</th><th>Output tok</th><th>Total tok</th><th>TTFT</th><th title="prompt tokens ÷ TTFT — an end-to-end estimate, not a measured server prefill rate">Prompt tok/s (TTFT est.)</th><th class="num">Med tok/s</th><th class="num">Min</th><th class="num">Max</th><th class="num">α̂ avg</th><th class="num">Depth avg</th></tr></thead>
             <tbody>
               @for (r of turnRows(); track r.n) {
                 <tr>
@@ -821,7 +878,7 @@
                   @if (r.label !== 'All') {
                     <span class="dot" [style.background]="color(r.label)"></span>
                   }
-                  {{ r.label }}
+                  {{ r.label === 'All' ? r.label : regimeLabel(r.label) }}
                 </td>
                 <td class="num">{{ r.med == null ? '—' : fmt1(r.med) }}</td>
                 <td class="num">{{ r.min == null ? '—' : fmt1(r.min) }}</td>
@@ -948,7 +1005,7 @@
                 <td class="num">{{ r.turns }}</td>
                 <td class="num">{{ fmtInt(r.n) }}</td>
                 <td class="num">{{ r.med == null ? '—' : fmt1(r.med) }}</td>
-                <td class="num">{{ r.ci == null ? '—' : '±' + fmt1((r.ci![1] - r.ci![0]) / 2) }}</td>
+                <td class="num" [title]="r.ci == null && r.n > 0 ? 'Fewer than 8 rate samples — no confidence interval is claimed' : ''">{{ r.ci == null ? (r.n > 0 ? 'insufficient' : '—') : '±' + fmt1((r.ci![1] - r.ci![0]) / 2) }}</td>
                 <td class="num">{{ r.volatility == null ? '—' : r.volatility!.toFixed(0) + '%' }}</td>
                 <td class="num">{{ statFor(r.regime)?.reasoningTokens ? fmtInt(statFor(r.regime)!.reasoningTokens) : '—' }}</td>
                 <td class="num">{{ statFor(r.regime)?.outputTokens ? fmtInt(statFor(r.regime)!.outputTokens) : '—' }}</td>
@@ -1026,7 +1083,7 @@
         </div>
         @if (conc(); as cc7) {
           <div class="muted small" style="padding:0 16px 8px">
-            Concurrent batch of {{ cc7.workers }} workers on one shared t=0 axis. Per-worker rate series use the same 3 s rolling window as single-stream reports (first 5 samples dropped as warm-up). The Σ line bins all workers' tokens per 200 ms; its median/min/max drive the headline stats. Acceptance-rate and speculation-depth figures remain estimates derived from the pooled inter-token gap stream.
+            Concurrent run of {{ cc7.workers }} workers × {{ cc7.steps }} barrier steps = {{ cc7.requests }} requests, plotted at each request's true start time (a worker runs its steps one after another, so requests do not share a t=0). Per-request rate series use the same 3 s rolling window as single-stream reports (first 5 samples dropped as warm-up). The Σ line bins all requests' tokens per 200 ms; its median/min/max drive the headline stats. A worker with fewer than 2 tokens in a step has no measurable rate and is excluded from the aggregate. Acceptance-rate and speculation-depth figures remain estimates derived from the pooled inter-token gap stream.
           </div>
         }
         <ul class="ledger">
@@ -1047,17 +1104,27 @@
             <div><b>Volatility</b>MAD ÷ median throughput — pacing predictability.</div>
             <div><b>P50 / P90 / P99</b>Median, and the value exceeded by 10% / 1% of samples.</div>
             @if (conc()) {
-              <div><b>Worker</b>One parallel stream of a concurrent batch; all workers share the same start time (t=0).</div>
-              <div><b>Σ line</b>Sum of every worker's tokens per 200 ms bin over the shared axis — the combined throughput curve.</div>
-              <div><b>Aggregate decode</b>Median of the Σ line — the headline tok/s for the batch.</div>
-              <div><b>End-to-end Σ÷wall</b>Total tokens ÷ longest worker duration; includes ramp-in (TTFT) and staggered finishes, so it sits below the Σ median on short runs.</div>
-              <div><b>Mean worker</b>Average of the workers' own sustained decode rates.</div>
+              <div><b>Run / worker / step / request</b>A run has W workers executing S barrier steps — that is W×S requests. The header counts each identity separately; they are never conflated.</div>
+              <div><b>Worker</b>One of the parallel streams of a concurrent run; each worker runs the plan's steps in sequence.</div>
+              <div><b>Σ line</b>Sum of every request's tokens per 200 ms bin over the run's true timeline — the combined throughput curve.</div>
+              <div><b>Aggregate sustained</b>Σ of the workers' sustained rates within each step, averaged across steps. Workers with fewer than 2 tokens in a step are excluded (no measurable rate).</div>
+              <div><b>End-to-end Σ÷wall</b>Total tokens ÷ true wall time (first request start → last request end); includes ramp-in (TTFT), step barriers and staggered finishes.</div>
+              <div><b>Mean worker</b>Average of the workers' own sustained decode rates (≥2-token requests only).</div>
             }
           </div>
         </section>
 
         <div class="muted small provenance mono">
-          @if (d.modelLabel) {<span>entry: {{ d.modelLabel }} · </span>}@if (turnSource()) {<span>tokens: {{ turnSource() }} · </span>}@if (d.helper_model) {<span>text classified by: {{ d.helper_model }} · </span>}analysed {{ fmtDate(analysedDate()) }} · report v{{ d.version ?? '—' }} · session {{ d.session.slice(0, 8) }}@if (sessionName()) { · "{{ sessionName() }}" }
+          <span>run {{ fmtDate(sessionDate()) || '—' }}</span> ·
+          @if (appVersion()) {<span>benchmark app v{{ appVersion() }}</span> · }
+          @if (d.version != null) {
+            <span>report schema v{{ d.version }}</span> ·
+          } @else {
+            <span>report schema unversioned</span> ·
+          }
+          @if (d.helper_model) {<span>classification by {{ d.helper_model }} · </span>}<span>analysed {{ fmtDate(analysedDate()) }}</span> ·
+          <span>session {{ d.session.slice(0, 8) }}</span>
+          @if (sessionName()) { · "{{ sessionName() }}" }
         </div>
       </div>
     }
@@ -1068,23 +1135,56 @@
         @for (r of legend(); track r) {
           <span class="key"><span class="dot" [style.background]="color(r)"></span>{{ regimeLabel(r) }}</span>
         }
+        <span class="tr-toggle">
+          <button class="chip" [class.active]="!transcriptRaw()" (click)="transcriptRaw.set(false)">Rendered</button>
+          <button class="chip" [class.active]="transcriptRaw()" (click)="transcriptRaw.set(true)">Raw text</button>
+        </span>
       </div>
 
       @for (t of d.turns; track t.benchmarkId) {
         <div class="turn card">
           <div class="turn-head muted small">
-            turn {{ $index + 1 }} · {{ t.model }} · {{ fmtDate(t.createdAt) }}
+            <span>turn {{ $index + 1 }} · {{ t.model }} · {{ fmtDate(t.createdAt) }}</span>
+            <span class="turn-flags">
+              @if (t.status === 'cancelled') {<span class="turnflag warn">CANCELLED</span>}
+              @if (t.finishReason === 'length') {<span class="turnflag warn" title="Output hit the generation budget">TRUNCATED</span>}
+              @if ((t.completionTokens ?? 0) === 0) {<span class="turnflag bad">EMPTY</span>}
+            </span>
           </div>
-          @for (sec of t.sections; track sec.kind) {
-            <div class="section">
-              <div class="section-label muted small">{{ sec.kind === 'reasoning' ? 'Reasoning' : 'Answer' }}</div>
-              <div class="text">
-                @for (sp of spans(sec); track $index) {
-                  <span class="seg" [style.background]="background(sp.regime)" [style.color]="color(sp.regime)"
-                        [title]="regimeLabel(sp.regime)">{{ sp.text }}</span>
-                }
-              </div>
+          @if (t.assertion) {
+            <div class="turn-assert mono small" [class.fail]="!t.assertion.pass">
+              assert {{ t.assertion.pass ? 'PASS' : 'FAIL' }}
+              @if (t.assertion.expect) {· expect "{{ t.assertion.expect }}"}
+              @if (t.assertion.expectRegex) {· regex "{{ t.assertion.expectRegex }}"}
+              @if (!t.assertion.pass && t.assertion.detail) {· {{ t.assertion.detail }}}
             </div>
+          }
+          <div class="turn-settings mono small">
+            @if (t.reasoningEnabled != null) {<span>reasoning {{ t.reasoningEnabled ? (t.reasoningEffort || 'on') : 'off' }}</span>}
+            @if (t.genBudget) {<span>budget {{ t.genBudget }} tok</span>}
+            @if (t.tokenSource) {<span>tokens: {{ t.tokenSource }}</span>}
+            @if (t.label) {<span>label: {{ t.label }}</span>}
+          </div>
+          @if (t.prompt) {
+            <details class="turn-prompt">
+              <summary class="muted small mono">user prompt</summary>
+              <pre class="prompt-text">{{ t.prompt }}</pre>
+            </details>
+          }
+          @if (transcriptRaw()) {
+            <pre class="raw-text">{{ rawTextOf(t) }}</pre>
+          } @else {
+            @for (sec of t.sections; track sec.kind) {
+              <div class="section">
+                <div class="section-label muted small">{{ sec.kind === 'reasoning' ? 'Reasoning' : 'Answer' }}</div>
+                <div class="text">
+                  @for (sp of spans(sec); track $index) {
+                    <span class="seg" [style.background]="background(sp.regime)" [style.color]="color(sp.regime)"
+                          [title]="regimeLabel(sp.regime)">{{ sp.text }}</span>
+                  }
+                </div>
+              </div>
+            }
           }
         </div>
       }

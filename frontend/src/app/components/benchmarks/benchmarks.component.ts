@@ -5,6 +5,7 @@ import { SettingsService } from '../../services/settings.service';
 import { Benchmark, SessionAnalysis, SessionGroup, SessionMeta } from '../../types';
 import { categoryColor } from '../../services/charts.service';
 import { regimeLabel as regimeLabelOf, regimeOrder } from '../../services/regimes';
+import { SessionsUiState } from '../../services/sessions-ui.service';
 
 @Component({
   selector: 'app-benchmarks',
@@ -13,14 +14,25 @@ import { regimeLabel as regimeLabelOf, regimeOrder } from '../../services/regime
   styleUrl: './benchmarks.component.css',
 })
 export class BenchmarksComponent implements OnInit, OnDestroy {
+  private ui: SessionsUiState;
+
   constructor(
     private api: ApiService,
     private router: Router,
     public ss: SettingsService,
-  ) {}
+    ui: SessionsUiState,
+  ) {
+    this.ui = ui;
+  }
 
-  /** Page view: the session index or the category manager. */
-  viewTab = signal<'sessions' | 'categories'>('sessions');
+  /** True once the first load finished — a half-loaded list must not read as
+   *  "no sessions" (review F7). */
+  loaded = signal(false);
+  loadError = signal('');
+
+  /** Page view: the session index or the category manager (delegated to the
+   *  UI-state service so it survives returning from a report). */
+  get viewTab() { return this.ui.viewTab; }
   categoryCounts = computed(() => {
     const counts = new Map<string, number>();
     for (const g of this.sessions()) {
@@ -77,17 +89,18 @@ export class BenchmarksComponent implements OnInit, OnDestroy {
   selected = signal<string | null>(null);
   private pollTimer: ReturnType<typeof setInterval> | null = null;
 
-  // ---------- filters ----------
-  filterKinds = signal<Set<string>>(new Set());
-  filterRegimes = signal<Set<string>>(new Set());
-  filterModels = signal<Set<string>>(new Set());
-  filterProviders = signal<Set<string>>(new Set());
-  /** all | sessions with a completed AI analysis | sessions without one */
-  filterAi = signal<'all' | 'ai' | 'no'>('all');
+  // ---------- filters (state lives in SessionsUiState; survives back-nav) --
+  get filterKinds() { return this.ui.filterKinds; }
+  get filterRegimes() { return this.ui.filterRegimes; }
+  get filterModels() { return this.ui.filterModels; }
+  get filterProviders() { return this.ui.filterProviders; }
+  get filterAi() { return this.ui.filterAi; }
+  get filterCats() { return this.ui.filterCats; }
+  get search() { return this.ui.search; }
+  get page() { return this.ui.page; }
+  get pageSize() { return this.ui.pageSize; }
   /** User-authored session metadata (custom name + managed category). */
   meta = signal<Record<string, SessionMeta>>({});
-  /** Category facet: managed category names, plus '__none' = uncategorized. */
-  filterCats = signal<Set<string>>(new Set());
   static readonly NO_CAT = '__none';
 
   sessionName(g: SessionGroup): string {
@@ -139,10 +152,7 @@ export class BenchmarksComponent implements OnInit, OnDestroy {
   selectionMode = signal(false);
   checked = signal<Set<string>>(new Set());
 
-  // ---------- pagination ----------
-  page = signal(1);
-  pageSize = signal(20);
-
+  // ---------- pagination (state in SessionsUiState) ----------
   totalPages = computed(() => Math.max(1, Math.ceil(this.filteredSessions().length / this.pageSize())));
 
   /** Current page, clamped into range (filters shrinking the list, etc.). */
@@ -172,14 +182,16 @@ export class BenchmarksComponent implements OnInit, OnDestroy {
 
   /** Overall decode rate for a session: total output tokens ÷ total decode
    *  time across turns with final stats (the honest weighted number, not a
-   *  per-turn average). */
+   *  per-turn average). Turns with fewer than 2 tokens are excluded: a
+   *  single token has no inter-token interval, so its "rate" is meaningless
+   *  and once inflated whole sessions (500 tok/s from 1-token answers). */
   overallTokS(g: SessionGroup): number | null {
     let toks = 0;
     let secs = 0;
     for (const t of g.turns) {
       const c = t.stats?.completion_tokens ?? 0;
       const d = t.stats?.decode_ms ?? 0;
-      if (c > 0 && d > 0) {
+      if (c >= 2 && d > 0) {
         toks += c;
         secs += d / 1000;
       }
@@ -187,11 +199,17 @@ export class BenchmarksComponent implements OnInit, OnDestroy {
     return secs > 0 ? toks / secs : null;
   }
 
-  providerOptions = computed(() => [...new Set(this.sessions().map((g) => g.provider))].sort());
-
   /** Facets combine with AND; members of one facet combine with OR. */
-  filteredSessions = computed(() =>
-    this.sessions().filter((g) => {
+  filteredSessions = computed(() => {
+    const q = this.search().trim().toLowerCase();
+    return this.sessions().filter((g) => {
+      if (q) {
+        const hay = [g.session, this.sessionName(g), g.model, g.provider, g.label, this.sessionCat(g)]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
       const fk = this.filterKinds();
       if (fk.size) {
         const kind = g.kind === 'concurrent' ? 'concurrent' : 'single';
@@ -205,7 +223,9 @@ export class BenchmarksComponent implements OnInit, OnDestroy {
       const fm = this.filterModels();
       if (fm.size && !fm.has(g.model)) return false;
       const fp = this.filterProviders();
-      if (fp.size && !fp.has(g.provider)) return false;
+      // Provider identity is case-insensitive: "DeepSeek" and "Deepseek" are
+      // one provider (review U3).
+      if (fp.size && !fp.has(g.provider) && ![...fp].some((p) => p.toLowerCase() === g.provider.toLowerCase())) return false;
       const fa = this.filterAi();
       const ai = this.analysisOf(g.session)?.status === 'done';
       if (fa === 'ai' && !ai) return false;
@@ -217,8 +237,25 @@ export class BenchmarksComponent implements OnInit, OnDestroy {
         if (!hit) return false;
       }
       return true;
-    }),
-  );
+    });
+  });
+
+  /** Distinct providers with case-insensitive identity (display name = the
+   *  most common original casing). */
+  providerOptions = computed(() => {
+    const counts = new Map<string, Map<string, number>>();
+    for (const g of this.sessions()) {
+      const key = g.provider.toLowerCase();
+      if (!counts.has(key)) counts.set(key, new Map());
+      const variants = counts.get(key)!;
+      variants.set(g.provider, (variants.get(g.provider) ?? 0) + 1);
+    }
+    return [...counts.values()]
+      .map((variants) =>
+        [...variants.entries()].sort((a, b) => b[1] - a[1])[0][0],
+      )
+      .sort((a, b) => a.localeCompare(b));
+  });
 
   toggleKind(k: string): void {
     this.flip(this.filterKinds, k);
@@ -299,11 +336,25 @@ export class BenchmarksComponent implements OnInit, OnDestroy {
       const map = new Map<string, SessionAnalysis>();
       for (const a of analyses) map.set(a.session, a);
       this.analyses.set(map);
+      this.loaded.set(true);
+      this.loadError.set('');
       this.updatePolling();
       void this.loadMeta();
     } catch (e) {
       console.warn('load sessions', e);
+      this.loaded.set(true);
+      this.loadError.set(String((e as any)?.message || e));
     }
+  }
+
+  /** Distinguishing short session id (review U3): the generic 8-char prefix
+   *  made concurrent runs collide ("conc-6a9"); keep the prefix + 8 random
+   *  chars so ids stay unique at a glance. */
+  shortId(id: string): string {
+    if (!id) return '';
+    const m = id.match(/^([a-z]+-)(.{6})/);
+    if (m) return m[1] + m[2] + id.slice(m[1].length + 6, m[1].length + 8);
+    return id.slice(0, 10);
   }
 
   /** Collapse per-turn records into one row per session id, newest first. */
@@ -325,6 +376,10 @@ export class BenchmarksComponent implements OnInit, OnDestroy {
         byId.set(b.session, g);
       }
       g.turns.push(b);
+      // For concurrent runs every turn is "{run label} · {step}"; the
+      // SHORTEST label carries the run identity without the step suffix
+      // (named runs surface under the user's label, review F6).
+      if ((b.label || '').length < (g.label || '').length || !g.label) g.label = b.label || g.label;
       if (b.created_at < g.createdAt) g.createdAt = b.created_at;
       g.totalTokens += b.stats.completion_tokens || b.stats.token_events.length || 0;
     }
@@ -445,6 +500,14 @@ export class BenchmarksComponent implements OnInit, OnDestroy {
     } catch (e: any) {
       alert('Analysis failed to start: ' + (e?.message ?? e));
     }
+  }
+
+  /** Short name of the configured helper (classification) model — the
+   *  analysis runs on THIS model, not the active generation model (U4). */
+  helperName(): string {
+    const m = this.ss.settings().helper?.model ?? '';
+    const parts = m.split('/');
+    return parts[parts.length - 1] || 'helper model';
   }
 
   async remove(g: SessionGroup): Promise<void> {

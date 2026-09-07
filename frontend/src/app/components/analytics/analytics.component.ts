@@ -119,6 +119,12 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
   readonly scopes: Scope[] = ['all', 'reasoning', 'output'];
   /** True while a PNG capture is running (the export buttons hide). */
   readonly capturing = signal(false);
+  /** Export progress / failure feedback (review A8: exports must report). */
+  readonly exportNote = signal('');
+  /** App (binary) version, from /api/health — shown in the provenance line. */
+  readonly appVersion = signal('');
+  /** Transcript mode: rendered (colored spans) or raw (plain text). */
+  readonly transcriptRaw = signal(false);
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private resizeHandler = () => this.redrawCharts();
 
@@ -150,6 +156,31 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
 
   sessionCat(): string {
     return this.sessionMeta()?.category?.trim() || '';
+  }
+
+  /** The best available session title for exports (owner request): the
+   *  user-given name wins; concurrent runs fall back to their RUN label
+   *  (the first " · " segment of the recorded turn labels — the run label
+   *  prefixes every step); single-stream test sessions fall back to the
+   *  test title. Manual chats have no meaningful title. */
+  private sessionTitleFor(d: any): string {
+    const custom = this.sessionName();
+    if (custom) return custom;
+    const t0 = (d?.turns ?? [])[0];
+    if (!t0) return '';
+    if (t0.kind === 'concurrent' && t0.label) {
+      return String(t0.label).split(' · ')[0].trim();
+    }
+    if (t0.kind === 'test' && t0.label && t0.label !== 'manual-chat') {
+      return String(t0.label);
+    }
+    return '';
+  }
+
+  /** Ensure the session meta is loaded before reading the title (guards the
+   *  open-then-immediately-export race). */
+  private async ensureMeta(session: string): Promise<void> {
+    if (this.sessionMeta() === null) await this.loadSessionMeta(session);
   }
 
   private async loadSessionMeta(session: string): Promise<void> {
@@ -190,8 +221,20 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
     window.addEventListener('resize', this.resizeHandler);
     void this.open(session).then(() => {
       if (!this.detail()) void this.router.navigateByUrl('/sessions');
+      // ?print=1 (the PDF export flow) opens the browser's print dialog with
+      // this report as the document — selectable-text, paginated A4 PDF.
+      if (this.route.snapshot.queryParamMap.get('print') === '1') {
+        document.title = `velobench-analytics-${this.detail()?.session.slice(0, 8) ?? 'report'}`;
+        window.onafterprint = () => window.close();
+        setTimeout(() => window.print(), 1500);
+      }
     });
     this.load();
+    // App version for the provenance footer (review A7: benchmark version is
+    // distinct from report/classification versions).
+    void this.api.health().then((h: any) => {
+      this.appVersion.set(String(h?.version ?? ''));
+    }).catch(() => { /* keep '' */ });
   }
 
   ngOnDestroy(): void {
@@ -347,12 +390,22 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
           (this.conc() && t.label?.trim()) ||
           this.turnNameFor(t, perSection.get(key) ?? 1, idxInSection) ||
           String(i + 1);
+        // Concurrent requests with fewer than 2 tokens have no measurable
+        // rate (review A2); empty/truncated outputs are flagged (review F1).
+        const isConc = !!this.conc();
+        const insufficientRate = isConc && out != null && out < 2;
+        const emptyOut = isConc && out === 0;
+        const truncated = isConc && String((t as any).finishReason || '') === 'length';
         return {
           n: i + 1, name, input: t.promptTokens ?? null, out, total, ttft: t.ttftMs ?? null, prefill, section: t.section ?? null,
-          med: t.liveMedianTokS ?? null,
-          min: t.liveMinTokS ?? null,
-          max: t.liveMaxTokS ?? null,
+          med: insufficientRate ? null : (t.liveMedianTokS ?? null),
+          min: insufficientRate ? null : (t.liveMinTokS ?? null),
+          max: insufficientRate ? null : (t.liveMaxTokS ?? null),
           acc, depth,
+          insufficientRate, emptyOut, truncated,
+          budget: (t as any).genBudget ?? null,
+          cancelled: String((t as any).status || '') === 'cancelled',
+          assertion: (t as any).assertion ?? null,
         };
       });
   });
@@ -665,7 +718,7 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
         label: 'All (Σ)',
         med: cc.sumMed, min: cc.sumMin, max: cc.sumMax, acc: accAvg, depth: depthAvg,
       }];
-      for (const r of cc.regimeSums) rows2.push({ label: r.regime, med: r.med, min: r.min, max: r.max, acc: null, depth: null });
+      for (const r of cc.regimeSums) rows2.push({ label: regimeLabelOf(r.regime), med: r.med, min: r.min, max: r.max, acc: null, depth: null });
       return rows2;
     }
     const rows = [row('All', this.scopeSamples(), this.scopeAcceptance(), this.scopeSpecDepth())];
@@ -699,7 +752,7 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
    *  their worker section; each group carries its own Σ / avg. */
   readonly turnGroups = computed(() => {
     if (!this.conc()) return [];
-    type Row = { n: number; name: string; input: number | null; out: number | null; total: number | null; ttft: number | null; prefill: number | null; section: string | null; med: number | null; min: number | null; max: number | null; acc: number | null; depth: number | null };
+    type Row = { n: number; name: string; input: number | null; out: number | null; total: number | null; ttft: number | null; prefill: number | null; section: string | null; med: number | null; min: number | null; max: number | null; acc: number | null; depth: number | null; insufficientRate: boolean; emptyOut: boolean; truncated: boolean; cancelled: boolean; budget: number | null; assertion: { expect: string; expectRegex: string; pass: boolean; detail: string } | null };
     type Grp = { name: string; rows: Row[]; agg: ReturnType<AnalyticsComponent['aggOfRows']> };
     const out: Grp[] = [];
     const byName = new Map<string, Grp>();
@@ -959,6 +1012,9 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
       medRate: s.medRate > 0 ? s.medRate : null,
       itlP90: m.itlP90,
       ttftP50: s.medianTtft,
+      // Time to first VISIBLE output (post-reasoning) — for reasoning models
+      // TTFT alone hides the wait for the actual answer (review A6).
+      ttfoP50: m.ttfo,
       outputTokens: s.outputTokens,
       stability: m.sustainPct,
       n: this.scopeSamples().length,
@@ -968,50 +1024,89 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
   /** Level-2 of the metric deck (§5): grouped strips. Extends `metrics` with
    * decode percentiles, volatility, TTFT percentiles, mix and run fields —
    * every previously visible number keeps a home. */
-  /** Concurrent-session aggregate (kind 'concurrent' turns): Σ tokens over the
-   *  batch wall clock — the headline number for parallel runs. */
+  /** Concurrent-session aggregate (kind 'concurrent' turns).
+   *
+   * Identities are counted separately (review A1): a run with W workers and
+   * S barrier steps records W×S requests — "8 workers" was the old bug.
+   * Rates respect sample sufficiency (review A2): a turn with fewer than 2
+   * tokens has no inter-token interval, so it contributes no sustained rate.
+   * All timelines are aligned to the requests' TRUE start times (absolute
+   * epoch ms), not a shared fake t=0.
+   */
   readonly conc = computed(() => {
     const turns = (this.detail()?.turns ?? []) as any[];
-    const workers = turns.filter((t) => t.kind === 'concurrent');
-    if (!workers.length) return null;
-    const totalTokens = workers.reduce((a, t) => a + (t.completionTokens ?? 0), 0);
-    // Workers start together, so the batch wall clock is the longest worker.
-    // total_ms ALREADY includes that turn's TTFT — do not add it again.
-    // Wall time for multi-step (test-driven) concurrent runs: from the first
-    // turn's start to the last turn's end, using turn timestamps. Falls back
-    // to the longest single turn when timestamps are missing.
-    const starts = workers.map((t) => Date.parse(String((t as any).createdAt || '')));
-    const ends = workers.map((t, i) => (Number.isFinite(starts[i]) ? starts[i] + (t.totalMs ?? 0) : NaN));
-    const wallMs = Number.isFinite(Math.min(...starts)) && Number.isFinite(Math.max(...ends))
-      ? Math.max(...ends) - Math.min(...starts)
-      : Math.max(...workers.map((t) => t.totalMs ?? 0));
-    const rates = workers.map((t) => t.finalTokS ?? 0).filter((r) => r > 0);
+    const reqs = turns.filter((t) => t.kind === 'concurrent');
+    if (!reqs.length) return null;
+    const workerIds = [...new Set(reqs.map((t) => String(t.section ?? '')).filter(Boolean))];
+    const stepIds = [...new Set(reqs.map((t) => String(t.label ?? '').trim()).filter(Boolean))];
+    const nWorkers = workerIds.length || reqs.length;
+    const nSteps = stepIds.length;
+    const nRequests = reqs.length;
+    const totalTokens = reqs.reduce((a, t) => a + (t.completionTokens ?? 0), 0);
+
+    // True absolute start of every request: the engine's t0 when recorded,
+    // else created_at (finish time) minus the measured duration.
+    const startAbs = reqs.map((t) => {
+      const s = (t as any).startedAtMs;
+      if (Number.isFinite(s) && s > 0) return s as number;
+      const c = Date.parse(String((t as any).createdAt || ''));
+      return Number.isFinite(c) ? c - (t.totalMs ?? 0) : NaN;
+    });
+    const validStarts = startAbs.filter((s) => Number.isFinite(s));
+    const t0 = validStarts.length ? Math.min(...validStarts) : NaN;
+    const endAbs = startAbs.map((s, i) => (Number.isFinite(s) ? s + (reqs[i].totalMs ?? 0) : NaN));
+    const wallMs = validStarts.length && endAbs.some((e) => Number.isFinite(e))
+      ? Math.max(...endAbs.filter((e) => Number.isFinite(e))) - t0
+      : Math.max(...reqs.map((t) => t.totalMs ?? 0));
+    const wallAgg = wallMs > 0 && totalTokens > 0 ? totalTokens / (wallMs / 1000) : null;
+
+    // Sample sufficiency: <2 completion tokens = no measurable rate.
+    const SUFFICIENT = 2;
+    const sufficient = reqs.map((t) => (t.completionTokens ?? 0) >= SUFFICIENT);
+    const emptyRequests = reqs.filter((t, i) => !sufficient[i] && (t.completionTokens ?? 0) === 0).length;
+    const insufficientRequests = sufficient.filter((s) => !s).length;
+
+    // Per-worker sustained rates (sufficient turns only), with per-step
+    // aggregation: a step's aggregate = Σ of its workers' sustained rates.
+    const perStep = new Map<string, number[]>();
+    reqs.forEach((t, i) => {
+      if (!sufficient[i]) return;
+      const rate = t.finalTokS ?? 0;
+      if (rate <= 0) return;
+      const key = String(t.label ?? '').trim() || 'step';
+      if (!perStep.has(key)) perStep.set(key, []);
+      perStep.get(key)!.push(rate);
+    });
+    const stepAggs = [...perStep.entries()].map(([label, rates]) => ({
+      label,
+      agg: rates.reduce((a, b) => a + b, 0),
+      workers: rates.length,
+    }));
+    const agg = stepAggs.length
+      ? stepAggs.reduce((a, s) => a + s.agg, 0) / stepAggs.length
+      : null;
+    const rates = reqs.map((t, i) => (sufficient[i] ? (t.finalTokS ?? 0) : 0)).filter((r) => r > 0);
     const meanWorker = rates.length ? rates.reduce((a, b) => a + b, 0) / rates.length : null;
-    // HEADLINE aggregate = Σ of the workers' SUSTAINED decode rates: N streams
-    // each holding ~X tok/s deliver N·X combined while they run. The
-    // wall-clock figure (Σ tokens ÷ longest worker) is kept separately — it
-    // is diluted by ramp-in (TTFT) and staggered finishes, which shrinks it
-    // on short runs far below the machine's actual concurrent capability.
-    const agg = rates.reduce((a, b) => a + b, 0);
-    const wallAgg = wallMs > 0 ? totalTokens / (wallMs / 1000) : null;
-    const ttfts = workers.map((t) => t.ttftMs ?? 0).filter((v) => v > 0);
+    const ttfts = reqs.map((t) => t.ttftMs ?? 0).filter((v) => v > 0);
     const ttftAvg = ttfts.length ? ttfts.reduce((a, b) => a + b, 0) / ttfts.length : null;
     const prefillAvg = (() => {
       const p: number[] = [];
-      for (const t of workers) {
+      for (const t of reqs) {
         if (t.promptTokens && t.ttftMs && t.ttftMs > 0) p.push(t.promptTokens / (t.ttftMs / 1000));
       }
       return p.length ? p.reduce((a, b) => a + b, 0) / p.length : null;
     })();
-    // ── Shared-timeframe analysis ────────────────────────────────────────
-    // All workers start together, so each turn's event tMs (relative to its
-    // own request) shares one t=0. Per-worker rolling-window rate series
-    // (same semantics as `samples()` but NO per-turn offset):
+    // ── True-timeframe analysis ──────────────────────────────────────────
+    // Every request's events are placed on the run's absolute timeline
+    // (start offset + event tMs), so staggered steps and workers appear at
+    // their real relative times. Per-request rolling-window rate series use
+    // the same semantics as `samples()` (3 s window, 120 ms throttle).
     const WINDOW_MS = 3000, MIN_SPAN_S = 0.5, PUSH_EVERY_MS = 120, WARMUP = 5;
     const workerSeries: Array<{ label: string; pts: Array<{ t: number; rate: number }> }> = [];
     const workerItls: number[] = [];
     const ttsts: number[] = [], ttfos: number[] = [];
-    workers.forEach((t, wi) => {
+    reqs.forEach((t, wi) => {
+      const off = Number.isFinite(startAbs[wi]) ? startAbs[wi] - t0 : 0;
       const evs: any[] = [];
       for (const sec of t.sections) for (const e of sec.events) evs.push(e);
       evs.sort((a, b) => a.tMs - b.tMs);
@@ -1037,26 +1132,31 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
         const rate = window.length >= 2 && spanS >= MIN_SPAN_S ? total / spanS : 0;
         if (lastPush == null || e.tMs - lastPush > PUSH_EVERY_MS) {
           lastPush = e.tMs;
-          pts.push({ t: e.tMs, rate });
+          pts.push({ t: off + e.tMs, rate });
         }
       }
       if (gaps.length) workerItls.push(gaps.reduce((a, b) => a + b, 0) / gaps.length);
-      workerSeries.push({ label: t.section || `worker ${wi + 1}`, pts: pts.slice(WARMUP) });
+      workerSeries.push({ label: String(t.label ?? '').trim() || t.section || `request ${wi + 1}`, pts: pts.slice(WARMUP) });
     });
-    // SUM series: tokens emitted by ALL workers per fixed 200 ms bin across
-    // the shared axis — one combined throughput curve for the batch. The
+    // Σ series: tokens emitted by ALL requests per fixed 200 ms bin across
+    // the true timeline — one combined throughput curve for the run. The
     // span runs first→last ACTIVE bin (mid-stream empty bins = stalls kept).
     const BIN_MS = 200;
-    const binify = (evs: Array<{ tMs: number; estTokens: number }>): Map<number, number> => {
+    const binify = (evs: Array<{ t: number; estTokens: number }>): Map<number, number> => {
       const m = new Map<number, number>();
       for (const e of evs) {
-        const b = Math.floor(e.tMs / BIN_MS) * BIN_MS;
+        const b = Math.floor(e.t / BIN_MS) * BIN_MS;
         m.set(b, (m.get(b) ?? 0) + e.estTokens);
       }
       return m;
     };
-    const allEvs: Array<{ tMs: number; estTokens: number; regime: string }> = [];
-    for (const t of workers) for (const sec of t.sections) for (const e of sec.events) allEvs.push(e);
+    const allEvs: Array<{ t: number; estTokens: number; regime: string }> = [];
+    reqs.forEach((t, wi) => {
+      const off = Number.isFinite(startAbs[wi]) ? startAbs[wi] - t0 : 0;
+      for (const sec of t.sections) for (const e of sec.events) {
+        allEvs.push({ t: off + e.tMs, estTokens: e.estTokens, regime: e.regime });
+      }
+    });
     const binRates = (m: Map<number, number>): Array<{ t: number; rate: number }> => {
       if (!m.size) return [];
       const keys = [...m.keys()].sort((a, b) => a - b);
@@ -1070,9 +1170,9 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
     const sumMed = sumRates.length ? sumRates[sumRates.length >> 1] : null;
     const sumMin = sumRates.length ? sumRates[0] : null;
     const sumMax = sumRates.length ? sumRates[sumRates.length - 1] : null;
-    // Per-regime SUM series (same binning, tokens of one regime only).
+    // Per-regime Σ series (same binning, tokens of one regime only).
     const regimeSums = (() => {
-      const byRegime = new Map<string, Array<{ tMs: number; estTokens: number }>>();
+      const byRegime = new Map<string, Array<{ t: number; estTokens: number }>>();
       for (const e of allEvs) {
         let arr = byRegime.get(e.regime);
         if (!arr) { arr = []; byRegime.set(e.regime, arr); }
@@ -1085,7 +1185,7 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
       }
       return out;
     })();
-    // Stability on the SUM series, average-based: mean vs peak bin rate.
+    // Stability on the Σ series, average-based: mean vs peak bin rate.
     const stabilityAvg = (() => {
       if (!sumRates.length) return null;
       const mean = sumRates.reduce((a, b) => a + b, 0) / sumRates.length;
@@ -1097,7 +1197,9 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
     const workerMin = rates.length ? Math.min(...rates) : null;
     const workerMax = rates.length ? Math.max(...rates) : null;
     return {
-      workers: workers.length, totalTokens, wallMs, agg, wallAgg, meanWorker, ttftAvg, prefillAvg,
+      workers: nWorkers, steps: nSteps, requests: nRequests,
+      totalTokens, wallMs, agg, wallAgg, meanWorker, ttftAvg, prefillAvg,
+      emptyRequests, insufficientRequests,
       workerSeries, sumSeries, sumMed, sumMin, sumMax, regimeSums, stabilityAvg, workerItls,
       itlAvg, ttstAvg, ttfoAvg, workerMin, workerMax,
     };
@@ -1149,12 +1251,19 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
         })()
       : m.tpot;
     const reasoningShare = s.tokens ? (s.reasoningTokens / s.tokens) * 100 : null;
+    // Thinking-to-output ratio from VALIDATED counts (review A3): the old
+    // formula fed a percentage where a fraction was expected and produced
+    // "~×-1.0". Zero visible output yields null — never a numeric claim.
+    const outTok = Math.max(0, s.outputTokens);
+    const thinkTok = Math.max(0, s.reasoningTokens);
+    const thinkingPerOutput = outTok > 0 && thinkTok > 0 ? thinkTok / outTok : null;
+    const allReasoningNoOutput = outTok === 0 && thinkTok > 0;
     return {
       ...m,
       tpot,
       avgMode,
       decodeP50, decodeP90, decodeP99, decodeTail, volatility,
-      ttftP50, ttftP95, ttftP99, tokMed, reasoningShare,
+      ttftP50, ttftP95, ttftP99, tokMed, reasoningShare, thinkingPerOutput, allReasoningNoOutput,
       totalTokens: s.tokens, reasoningTokens: s.reasoningTokens,
       outputTokens: avgMode && conc ? s.outputTokens / conc.workers : s.outputTokens,
       outputTotal: s.outputTokens,
@@ -1181,10 +1290,18 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
     if (first?.reasoningEnabled != null) {
       chips.push('reasoning ' + (first.reasoningEnabled ? (first.reasoningEffort || 'default') : 'off'));
     }
-    // Concurrent run: N parallel workers (kind recorded on every turn).
-    const conc = turns.filter((t) => t.kind === 'concurrent').length;
-    if (conc > 0) chips.push('⚡ concurrent ×' + conc);
-    chips.push('run ' + (d?.session.slice(0, 8) ?? '—'));
+    // Concurrent run: distinct identities — W workers, S barrier steps,
+    // R requests (kind recorded on every turn). Never conflate them.
+    const concTurns = turns.filter((t) => t.kind === 'concurrent');
+    if (concTurns.length > 0) {
+      const wIds = new Set(concTurns.map((t) => String((t as any).section ?? '')).filter(Boolean));
+      const sIds = new Set(concTurns.map((t) => String(t.label ?? '').trim()).filter(Boolean));
+      chips.push(`⚡ concurrent · ${wIds.size || concTurns.length} workers · ${sIds.size} steps · ${concTurns.length} requests`);
+    }
+    // Distinguishing short id (review U3): the 8-char prefix made concurrent
+    // runs collide ("conc-6a9"); keep the prefix + 8 random chars.
+    const sid = d?.session ?? '';
+    chips.push('run ' + (sid ? sid.slice(0, 13) : '—'));
     if (d?.version != null) chips.push('report v' + d.version);
     return {
       status,
@@ -1194,7 +1311,9 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
       moreModels: combos.length > 1 ? `+${combos.length - 1}` : null,
       chips,
       timestamp: this.sessionDate(),
-      duration: this.deck().genMs ? this.fmtDur(this.deck().genMs) : '—',
+      // Concurrent runs report the true wall time (first start → last end),
+      // not the Σ of per-request decode times.
+      duration: this.conc() ? this.fmtDur(this.conc()!.wallMs) : (this.deck().genMs ? this.fmtDur(this.deck().genMs) : '—'),
       turns: turns.length,
     };
   });
@@ -1252,8 +1371,30 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
     if (cc) {
       // Concurrency-specific findings — single-stream regime narratives
       // don't apply to a parallel batch.
+      // Validity first (review F1): requests with no visible output make the
+      // run unusable as a benchmark result, whatever the HTTP layer said.
+      const assertFails = (this.detail()?.turns ?? [] as any[]).filter(
+        (t) => (t as any).assertion && !(t as any).assertion.pass,
+      ).length;
+      if (assertFails > 0) {
+        out.push({
+          text: `${assertFails} request(s) FAILED their answer assertions — the run is not a valid benchmark result for those steps; check the request table`,
+          href: '#sec-requests',
+        });
+      }
+      if (cc.emptyRequests > 0) {
+        out.push({
+          text: `${cc.emptyRequests} of ${cc.requests} requests returned NO visible output — this run is not a valid benchmark result; check the effective generation budget and finish reasons in the request table`,
+          href: '#sec-requests',
+        });
+      } else if (cc.insufficientRequests > 0) {
+        out.push({
+          text: `${cc.insufficientRequests} of ${cc.requests} requests produced fewer than 2 tokens — no sustained rate can be measured from them (shown as insufficient data)`,
+          href: '#sec-requests',
+        });
+      }
       if (cc.workers > 1) {
-        if (cc.wallAgg != null && cc.agg > 0) {
+        if (cc.agg != null && cc.wallAgg != null && cc.agg > 0) {
           const pct = (cc.wallAgg / cc.agg) * 100;
           out.push({
             text: `End-to-end Σ÷wall reached ${this.fmtPct(pct, 0)} of the sustained Σ (${this.fmt1n(cc.wallAgg)} vs ${this.fmt1n(cc.agg)} tok/s) — ramp-in and staggered finishes absorb the rest on a ${this.fmtDur(cc.wallMs)} batch`,
@@ -1308,7 +1449,7 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
       const acc = this.scopeAcceptance();
       const meanAcc = acc.length ? acc.reduce((a, b) => a + b.rate, 0) / acc.length : null;
       out.push({
-        text: `Bimodal latency: split ${sc.split.toFixed(1)} ms${meanAcc != null ? `, estimated acceptance ${meanAcc.toFixed(0)}%` : ''} — speculation signature`,
+        text: `Bimodal latency: split ${sc.split.toFixed(1)} ms${meanAcc != null ? `, estimated acceptance ${meanAcc.toFixed(0)}%` : ''} — hypothesis: speculative decoding (needs server counters to confirm)`,
         href: '#sec-quality',
       });
     }
@@ -1418,7 +1559,7 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
       items.push(`Label provenance: ${pct(freeTok)}% deterministic, ${pct(assistedTok)}% helper-assisted (by segment tokens)`);
     }
     if (fallbackTok > 0) items.push(`Classification fallback (other prose): ${fallbackShare.toFixed(1)}% of tokens`);
-    if (missingUsage) items.push(`Prompt-token usage missing on ${missingUsage}/${turns.length} turns — prefill tok/s unavailable`);
+    if (missingUsage) items.push(`Prompt-token usage missing on ${missingUsage}/${turns.length} turns — prompt tok/s (TTFT est.) unavailable`);
     else items.push(`Prompt-token usage present on all turns`);
     return items;
   });
@@ -1712,6 +1853,24 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
         });
       }
     }
+    this.labelCanvases();
+  }
+
+  /** Every canvas gets role=img and a meaningful accessible name derived
+   *  from its section heading + unit caption, so screen readers identify
+   *  the chart's purpose instead of raw element ids like "cvRate"
+   *  (review U5). */
+  private labelCanvases(): void {
+    const root = this.el.nativeElement as HTMLElement;
+    for (const cv of root.querySelectorAll('canvas')) {
+      if (cv.getAttribute('aria-label')) continue;
+      const card = cv.closest('.chart-card, .perf-card, .perf-sec, .card') as HTMLElement | null;
+      const head = card?.querySelector('.chart-head h4, .chart-head h3, .perf-label, h3')?.textContent?.trim();
+      const unit = card?.querySelector('.chart-unit, .perf-sub')?.textContent?.trim();
+      if (!head) continue;
+      cv.setAttribute('role', 'img');
+      cv.setAttribute('aria-label', unit ? `${head}: ${unit}` : head);
+    }
   }
 
   // ---------- header info + export ----------
@@ -1745,11 +1904,91 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
    * the visible portion. Restored in `finally`.
    */
   async exportPNG(): Promise<void> {
-    await this.capturePage((page, name) => this.charts.exportPNG(page, name));
+    this.exportNote.set('Exporting PNG…');
+    try {
+      await this.capturePage((page, name) => this.charts.exportPNG(page, name));
+      this.exportNote.set(`PNG saved (full dashboard image).`);
+      setTimeout(() => this.exportNote.set(''), 4000);
+    } catch (e: any) {
+      this.exportNote.set(`PNG export failed: ${e?.message || e}`);
+    }
   }
 
-  async exportPDF(): Promise<void> {
-    await this.capturePage((page, name) => this.charts.exportPDF(page, name));
+  /** Real paginated PDF (review A8): opens this report in a print window —
+   *  the browser's Save-as-PDF produces ordinary A4 pages with SELECTABLE
+   *  text, repeated table heads and page numbers, unlike the old one-page
+   *  image screenshot. The document title doubles as the filename. */
+  exportPDF(): void {
+    const sid = this.detail()?.session.slice(0, 8) ?? 'report';
+    const w = window.open(`/analytics/${encodeURIComponent(this.detail()?.session ?? '')}?print=1`, '_blank');
+    if (!w) {
+      this.exportNote.set("PDF export blocked — allow popups for VeloBenchmark, or use the browser's print dialog.");
+    } else {
+      this.exportNote.set('PDF: a print dialog opens in a new window — choose "Save as PDF".');
+    }
+  }
+
+  /** Request-level metrics as CSV (review M5): one row per recorded turn,
+   *  plain arithmetic reproducible in any spreadsheet. No credentials. */
+  async exportCSV(): Promise<void> {
+    const d = this.detail();
+    if (!d) return;
+    await this.ensureMeta(d.session);
+    // Session identity on every row (owner request): the custom title (or
+    // the run/test label for unnamed sessions), plus the session id —
+    // exports stay groupable/joinable after leaving the app.
+    const sessionTitle = this.sessionTitleFor(d);
+    const cols = [
+      'sessionTitle', 'session', 'benchmarkId', 'createdAt', 'kind', 'label', 'section', 'provider', 'model',
+      'promptTokens', 'completionTokens', 'contentTokens', 'reasoningTokens',
+      'ttftMs', 'decodeMs', 'totalMs', 'finalTokS', 'liveAvgTokS', 'liveMinTokS',
+      'liveMedianTokS', 'liveMaxTokS', 'finishReason', 'status', 'genBudget',
+      'requestId', 'reasoningEnabled', 'reasoningEffort', 'tokenSource', 'prompt',
+    ];
+    const esc = (v: unknown): string => {
+      const s = v == null ? '' : String(v);
+      return s.includes(',') || s.includes('"') || s.includes(String.fromCharCode(10))
+        ? '"' + s.replace(/"/g, '""') + '"'
+        : s;
+    };
+    const rows = (d.turns as any[]).map((t) =>
+      cols.map((c) =>
+        c === 'sessionTitle' ? esc(sessionTitle) : c === 'session' ? esc(d.session) : esc((t as any)[c]),
+      ).join(','),
+    );
+    const csv = [cols.join(','), ...rows].join(String.fromCharCode(10));
+    this.downloadText(csv, `velobench-session-${d.session.slice(0, 8)}.csv`, 'text/csv');
+    this.exportNote.set(`CSV saved (${rows.length} request rows).`);
+    setTimeout(() => this.exportNote.set(''), 4000);
+  }
+
+  /** The full per-request analysis payload as JSON (review M5): everything
+   *  the report computed, ready for independent re-derivation. */
+  async exportJSON(): Promise<void> {
+    const d = this.detail();
+    if (!d) return;
+    await this.ensureMeta(d.session);
+    const payload = {
+      ...d,
+      sessionTitle: this.sessionTitleFor(d) || null,
+      appVersion: this.appVersion(),
+      exportedAt: new Date().toISOString(),
+    };
+    this.downloadText(JSON.stringify(payload, null, 2), `velobench-session-${d.session.slice(0, 8)}.json`, 'application/json');
+    this.exportNote.set(`JSON saved (${(d.turns ?? []).length} request records).`);
+    setTimeout(() => this.exportNote.set(''), 4000);
+  }
+
+  private downloadText(text: string, name: string, mime: string): void {
+    const blob = new Blob([text], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
   }
 
   /** Expand the scroll container to full content height, rasterise, restore. */
@@ -1771,6 +2010,14 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
       page.style.overflow = prevOverflow;
       this.capturing.set(false);
     }
+  }
+
+  /** Raw plain-text transcript of one turn (reasoning + answer). */
+  rawTextOf(t: any): string {
+    return (t.sections ?? [])
+      .map((sec: any) => sec.text ?? '')
+      .filter(Boolean)
+      .join(String.fromCharCode(10) + String.fromCharCode(10));
   }
 
   // ---------- transcript rendering ----------
@@ -1885,7 +2132,13 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
     const contentGaps = this.gaps().filter((g) => g.kind === 'content');
     const contentTime = contentGaps.reduce((a, g) => a + g.dt, 0);
     const outputRate = contentTime > 0 && d.outputTokens > 0 ? d.outputTokens / (contentTime / 1000) : null;
-    const overallRate = d.genMs > 0 ? d.totalTokens / (d.genMs / 1000) : null;
+    // Concurrent runs: Σ of per-turn decode times is NOT the wall clock (it
+    // divides by microseconds and produces absurd rates on 1-token turns) —
+    // the honest figure is Σ tokens over the TRUE wall time.
+    const cc = this.conc();
+    const overallRate = cc
+      ? cc.wallAgg
+      : d.genMs > 0 ? d.totalTokens / (d.genMs / 1000) : null;
     // Throughput range track: markers positioned proportionally to peak.
     const pos = (v: number | null): number =>
       v == null || d.maxRate == null || d.maxRate <= 0 ? 0 : Math.min(100, Math.max(0, (v / d.maxRate) * 100));

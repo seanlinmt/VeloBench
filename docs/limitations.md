@@ -79,3 +79,28 @@ single-binary, zero-dependency tool.
   regenerating both sides; there is no compatibility shim across versions.
 - **API keys are non-caching but the model list re-fetch is live** — providers
   without a `/v1/models` endpoint need models entered manually.
+
+
+## Print / PDF export
+
+- The PDF export is produced by the browser's Save-as-PDF over a dedicated
+  print window: selectable text, paginated A4, colors forced so the app's
+  dark design survives. Inter-panel text on the white page prints dark so it
+  stays readable.
+- **Planned, not done yet:** a proper print/paper layout — light-theme page
+  (the dark panels are ink-heavy and not ideal on white paper), re-styled
+  cards and charts for grayscale/light printing, and repeated table headings
+  tuned per section. Tracked for a future pass; the current export keeps the
+  on-screen look for fidelity.
+
+## Accessibility
+
+- Keyboard/screen-reader support received one implementation pass: accessible
+  nav names at every breakpoint, `aria-current`, real buttons/links for
+  formerly generic clickable cards (sessions rows, comparison pickers and
+  saved comparisons), `role=img` + meaningful names on every chart canvas,
+  an sr-only metric summary on reports, and visible `:focus-visible`
+  outlines. This is **not a formal WCAG audit** — no automated axe scan or
+  external compliance claim has been made, and chart DATA (beyond the summary
+  line) is exposed via the per-request tables rather than per-chart data
+  tables.

@@ -61,9 +61,23 @@
                       <span class="m-chip params mono" [title]="paramsTitle(m)">{{ paramsSummary(m) }}</span>
                     }
                   </div>
-                  <span class="m-chip tok" [title]="tokSources()[mKey(p, m)] || 'no tokenizer — counts are flagged estimates'">
+                  <span class="m-chip ready" [title]="readyTitle(m)">
+                    @if (m.last_check?.ok) {
+                      <span class="ok">✓ verified</span><span class="src mono">{{ fmtCheckAt(m) }}</span>
+                    } @else if (m.last_check) {
+                      <span class="none">✗ {{ (m.last_check.error || 'failed').slice(0, 24) }}</span>
+                    } @else {
+                      <span class="none">— untested</span>
+                    }
+                  </span>
+                  <button class="btn mini-check" (click)="checkModel(p, m)"
+                          [disabled]="checkingModels().has(mKey(p, m))"
+                          title="Send a tiny live request to verify this model entry (auth, model id, reachability)">{{ checkingModels().has(mKey(p, m)) ? 'checking…' : 'Check' }}</button>
+                  <span class="m-chip tok" [title]="tokChecked() ? (tokSources()[mKey(p, m)] || 'no tokenizer — counts are flagged estimates') : 'checking tokenizer…'">
                     @if (tokSources()[mKey(p, m)]) {
                       <span class="ok">✓ tokenizer</span><span class="src mono">{{ tokSources()[mKey(p, m)] }}</span>
+                    } @else if (!tokChecked()) {
+                      <span class="none">— checking…</span>
                     } @else {
                       <span class="none">— no tokenizer (flagged estimates)</span>
                     }
