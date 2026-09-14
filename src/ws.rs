@@ -393,13 +393,22 @@ async fn run(mut socket: WebSocket, st: AppState) {
 
     // Finalise.
     //
+    // A cancelled turn skips the per-chunk exact counting: a looping or
+    // runaway generation can hold tens of thousands of chunks, and
+    // finish_exact's per-chunk tokenization made Stop appear to hang for
+    // minutes after the stream was already stopped. Estimates (snapping to
+    // provider usage when it arrived) are plenty for a cancelled partial.
+    let gen = if was_cancelled {
+        engine.finish(now_ms())
+    } else {
+        engine.finish_exact(&st.http, handle.as_deref(), now_ms()).await
+    };
+
     // No helper-LLM work happens here — by design. The live stats path is a
     // pure timing pipeline: the moment generation ends we send Done and record
     // the benchmark, so the client is free immediately. LLM-assisted analytics
     // runs ONLY when the user explicitly clicks "Analyze" on a session
     // (src/analyze.rs); regimes/categories arrive on the records afterwards.
-    let gen = engine.finish_exact(&st.http, handle.as_deref(), now_ms()).await;
-
     // Refine the per-model live calibration with this turn's observation and
     // rescale the recorded timeline to the true token count when usage is
     // available (the live path estimates; the stored stats end up exact).

@@ -12,7 +12,6 @@ use uuid::Uuid;
 
 const MIN_SPEED_SPAN: f64 = 0.5; // seconds before we trust a rate
 const WINDOW_MS: f64 = 3000.0;
-const MAX_SPEC_DEPTH: usize = 8;
 
 #[derive(Clone, Debug, Default)]
 pub struct LiveStats {
@@ -840,6 +839,8 @@ impl StatsEngine {
 
         // Speculation depth: runs of consecutive low-latency items (>= 2),
         // over the same once-classified labels as the acceptance series.
+        // No fixed depth cap: the chart's slot count derives from the data,
+        // so runs deeper than the drafter's nominal length are not dropped.
         let mut depth_counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
         let mut run = 0usize;
         let bump = |depth: &mut std::collections::HashMap<usize, usize>, run: usize| {
@@ -858,7 +859,6 @@ impl StatsEngine {
         bump(&mut depth_counts, run);
         let mut spec_depth: Vec<SpecDepthPoint> = depth_counts
             .into_iter()
-            .filter(|&(d, _)| d <= MAX_SPEC_DEPTH)
             .map(|(d, c)| SpecDepthPoint { depth: d, count: c })
             .collect();
         spec_depth.sort_by(|a, b| a.depth.cmp(&b.depth));
@@ -1262,6 +1262,25 @@ mod tests {
         assert!(split2.is_some());
         assert!(split2.unwrap() <= split1.unwrap(),
             "split only lowers: s1={} s2={}", split1.unwrap(), split2.unwrap());
+    }
+
+    #[test]
+    fn spec_depth_keeps_long_runs() {
+        // A low-latency stretch far beyond the old fixed 8-slot cap must
+        // survive into the distribution — the slot count is data-driven now.
+        let mut e = StatsEngine::new();
+        let mut clock = 0.0;
+        e.begin_run(clock);
+        feed(&mut e, &mut clock, 40, 1.0);
+        e.latency_split = Some(5.0);
+        feed(&mut e, &mut clock, 1, 1.0); // one more delta -> recompute with the split
+        let sd = e.analytics().spec_depth.clone();
+        assert!(
+            sd.iter().any(|p| p.depth >= 30),
+            "long low-latency runs must not be dropped, got {sd:?}"
+        );
+        assert!(sd.iter().all(|p| p.depth >= 2), "only runs of >= 2 count");
+        assert!(sd.windows(2).all(|w| w[0].depth < w[1].depth), "sorted by depth");
     }
 
     #[test]

@@ -3,6 +3,7 @@ import { ActivatedRoute, Router } from '@angular/router';
 import { ApiService } from '../../services/api.service';
 import { ChartsService } from '../../services/charts.service';
 import { SideStats, sideStats } from '../../services/compare';
+import { specDepthDomain } from '../../services/latency-clusters';
 import { SessionAnalysisDetail } from '../../types';
 
 interface Row {
@@ -312,21 +313,22 @@ export class CompareComponent implements OnInit {
 
     // Two parallel speculation-depth distributions — the SAME specDepthSeries
     // data and the SAME chart call as the analytics reports (category bars
-    // over accepted-run lengths; the depth axis is categorical so both charts
-    // share it inherently).
+    // over accepted-run lengths; the pair shares one data-derived domain so
+    // both charts stay directly comparable).
     if (this.sdA() && this.sdB()) {
       const sdWin: 'A' | 'B' | null =
         !A.specDist.length || !B.specDist.length || A.specDepth === B.specDepth
           ? null
           : (A.specDepth ?? 0) > (B.specDepth ?? 0) ? 'A' : 'B';
+      const sdDomain = specDepthDomain(A.specDist, B.specDist);
       this.charts.drawCategoryBars(this.sdA()!.nativeElement, A.specDist, {
         color: pairColor('A', sdWin),
-        domain: [2, 8],
+        domain: sdDomain,
         emptyLabel: 'no speculation data (est. from gap runs)',
       });
       this.charts.drawCategoryBars(this.sdB()!.nativeElement, B.specDist, {
         color: pairColor('B', sdWin),
-        domain: [2, 8],
+        domain: sdDomain,
         emptyLabel: 'no speculation data (est. from gap runs)',
       });
     }

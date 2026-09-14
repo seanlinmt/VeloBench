@@ -3,6 +3,7 @@ import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
 import { LiveSample } from '../types';
 import { regimeColor, regimeLabel as regimeLabelOf, withAlpha } from './regimes';
+import { specDepthDomain } from './latency-clusters';
 
 /** One decoded sample for the hero timeline. */
 export interface HeroSample {
@@ -29,6 +30,26 @@ function brandRamp(t: number): string {
 @Injectable({ providedIn: 'root' })
 export class ChartsService {
   /** Decode-speed line chart, coloured per regime, with min/median/max lines. */
+  /** Owner-requested y-domain: the min/max of the VISIBLE values with a 5%
+   *  margin on each side. The min ignores non-positive samples — spin-up
+   *  zeros are not data and would pin the floor to 0. */
+  private dynDomain(vs: number[]): { min: number; max: number } {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const v of vs) {
+      if (!isFinite(v)) continue;
+      if (v > 0) lo = Math.min(lo, v);
+      hi = Math.max(hi, v);
+    }
+    if (!isFinite(lo)) lo = 0;
+    if (!isFinite(hi) || hi <= 0) hi = 1;
+    let min = lo * 0.95;
+    let max = hi * 1.05;
+    if (max - min < 1e-9) max = min + 1;
+    if (min < 0) min = 0;
+    return { min, max };
+  }
+
   drawDecode(canvas: HTMLCanvasElement, samples: LiveSample[], opts?: {
     showStatLines?: boolean;
     tintBackground?: boolean;
@@ -58,10 +79,9 @@ export class ChartsService {
       min = opts.fixedDomain.min;
       max = opts.fixedDomain.max;
     } else {
-      min = Math.min(...vs); max = Math.max(...vs);
-      if (!isFinite(min) || !isFinite(max) || max === min) { max = min + 1; min = 0; }
-      const pad = (max - min) * 0.12 || 1;
-      min -= pad; max += pad;
+      const d = this.dynDomain(vs);
+      min = d.min;
+      max = d.max;
     }
     // Throughput never auto-scales below zero (§6).
     if (min < 0) min = 0;
@@ -175,10 +195,11 @@ export class ChartsService {
     const padL = 52, padR = 12, padT = 12, padB = 34; // extra bottom for the rail
     const plotW = w - padL - padR, plotH = h - padT - padB;
     const vs = samples.map((p) => p.tok_s);
-    let max = Math.max(...vs);
-    if (!isFinite(max) || max <= 0) max = 1;
-    max *= 1.08;
-    const min = 0;
+    // Owner request: y axis follows the visible min/max with a 5% margin
+    // (was pinned to a 0-floor with an 8% headroom).
+    const dom = this.dynDomain(vs);
+    const min = dom.min;
+    const max = dom.max;
     const t0 = samples[0].t_ms, t1 = samples[samples.length - 1].t_ms;
     const span = Math.max(t1 - t0, 1000);
     const xFor = (t: number) => padL + ((t - t0) / span) * plotW;
@@ -928,9 +949,10 @@ export class ChartsService {
       t0 = Math.min(t0, p.t); t1 = Math.max(t1, p.t);
     }
     if (!isFinite(lo) || hi <= 0) { this.empty(ctx, w, h, 'no samples'); return; }
-    const band = hi - lo || hi;
-    const min = Math.max(0, lo - band * 0.08);
-    const max = hi + band * 0.10;
+    // Owner request: y axis follows the visible min/max with a 5% margin.
+    const dom = this.dynDomain(all.map((p) => p.rate));
+    const min = dom.min;
+    const max = dom.max;
     this.grid(ctx, w, h, padL, padR, padT, padB, plotW, plotH, min, max, (v) => v.toFixed(0));
     // x tick labels in seconds
     ctx.fillStyle = 'rgba(148,163,184,.75)';
@@ -1012,15 +1034,18 @@ export class ChartsService {
     emptyLabel?: string;
     /** Solid fill overriding the brand ramp (compare pairs: winner/loser). */
     color?: string;
-    /** Fixed numeric X domain (e.g. [2, 8]): depths plot at their value on a
-     *  shared axis so every speculation-depth chart in the app aligns. */
+    /** Shared numeric X domain for paired charts (report scope+regimes,
+     *  compare A/B). When omitted it derives from the data: one slot per
+     *  integer depth from 2 to the deepest observed run. */
     domain?: [number, number];
   }): void {
     const s = this.setup(canvas);
     if (!s) return;
     const { ctx, w, h } = s;
     this.clear(ctx, w, h);
-    if (items.length < 1 && !opts?.domain) {
+    if (!items.length) {
+      // No series (or no bimodal split) never draws a skeleton axis: with a
+      // data-driven slot count an axis without data has no meaning.
       this.empty(ctx, w, h, opts?.emptyLabel);
       return;
     }
@@ -1028,41 +1053,34 @@ export class ChartsService {
     const plotW = w - padL - padR, plotH = h - padT - padB;
     const top = Math.max(1, ...items.map((i) => i.count));
     this.grid(ctx, w, h, padL, padR, padT, padB, plotW, plotH, 0, top, (v) => v.toFixed(0));
-    if (opts?.domain) {
-      // Fixed numeric axis: one slot per integer depth in the domain, drawn
-      // even when empty so the X range is identical across every chart.
-      const [lo, hi] = opts.domain;
-      const xFor = (d: number) => padL + ((d - lo) / (hi - lo)) * plotW;
-      const bw = Math.max(6, Math.min(40, plotW / (hi - lo + 1) - 6));
-      const byDepth = new Map(items.map((i) => [i.depth, i.count]));
-      ctx.font = '10px ui-monospace, monospace';
-      ctx.textAlign = 'center';
-      for (let d = Math.ceil(lo); d <= Math.floor(hi); d++) {
-        const count = byDepth.get(d) ?? 0;
-        const cx = xFor(d);
-        const bh = (count / top) * plotH;
-        const t = (d - lo) / Math.max(hi - lo, 1);
-        // §6/§7: distributions use the brand ramp — regime greens are reserved.
-        ctx.fillStyle = opts?.color ?? brandRamp(t);
-        ctx.fillRect(cx - bw / 2, padT + plotH - bh, bw, bh);
-        ctx.fillStyle = 'rgba(148,163,184,.7)';
-        ctx.fillText(String(d), cx, h - 4);
-      }
-      return;
-    }
-    const bw = Math.max(8, Math.min(40, plotW / items.length - 4));
-    items.forEach((it, idx) => {
-      const cx = padL + (idx + 0.5) * (plotW / items.length);
-      const bh = (it.count / top) * plotH;
-      const t = items.length === 1 ? 0 : idx / (items.length - 1);
+    // Numeric axis: one slot per integer depth. Empty slots stay (so gaps in
+    // the distribution are visible) but the column count follows the data —
+    // "runs of 2..N" — instead of a hardcoded window.
+    const dom = opts?.domain ?? specDepthDomain(items) ?? [2, 2];
+    const lo = Math.ceil(dom[0]);
+    const hi = Math.max(lo, Math.floor(dom[1]));
+    const span = hi - lo;
+    const slotW = plotW / (span + 1);
+    const xFor = (d: number) => padL + (span > 0 ? ((d - lo) / span) * plotW : plotW / 2);
+    const bw = Math.max(3, Math.min(40, slotW - 6));
+    const byDepth = new Map(items.map((i) => [i.depth, i.count]));
+    // Thin the x labels when slots get tighter than a label is wide.
+    const every = Math.max(1, Math.ceil(12 / slotW));
+    ctx.font = '10px ui-monospace, monospace';
+    ctx.textAlign = 'center';
+    for (let d = lo; d <= hi; d++) {
+      const count = byDepth.get(d) ?? 0;
+      const cx = xFor(d);
+      const bh = (count / top) * plotH;
+      const t = span > 0 ? (d - lo) / span : 0;
       // §6/§7: distributions use the brand ramp — regime greens are reserved.
       ctx.fillStyle = opts?.color ?? brandRamp(t);
       ctx.fillRect(cx - bw / 2, padT + plotH - bh, bw, bh);
-      ctx.fillStyle = 'rgba(148,163,184,.7)';
-      ctx.font = '10px ui-monospace, monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText(String(it.depth), cx, h - 4);
-    });
+      if ((d - lo) % every === 0 || d === hi) {
+        ctx.fillStyle = 'rgba(148,163,184,.7)';
+        ctx.fillText(String(d), cx, h - 4);
+      }
+    }
   }
 
   // ---------- export ----------

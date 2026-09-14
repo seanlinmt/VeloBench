@@ -40,6 +40,7 @@ import {
   detectLatencyClusters,
   histogramMax,
   percentileRobust,
+  specDepthDomain,
   specDepthSeries,
   trailingMovingAverage,
 } from '../../services/latency-clusters';
@@ -175,6 +176,12 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
       return String(t0.label);
     }
     return '';
+  }
+
+  /** The report header's display title: the same resolver the exports use —
+   *  custom name, else the concurrent run label / test title, else ''. */
+  displayTitle(): string {
+    return this.sessionTitleFor(this.detail());
   }
 
   /** Ensure the session meta is loaded before reading the title (guards the
@@ -1772,12 +1779,18 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
         },
       );
     }
-    // Speculation depth distribution (bars, white -> green).
+    // Speculation depth distribution (bars, white -> green). One shared,
+    // data-derived domain for the scope chart and every per-regime block:
+    // columns run from 2 to the deepest run observed anywhere in the report.
+    const sdDomain = specDepthDomain(
+      this.scopeSpecDepth(),
+      ...this.regimeViews().map((v) => v.specDepth),
+    );
     const sdCanvas = q('#cvSpecDepth');
     if (sdCanvas) {
       this.charts.drawCategoryBars(sdCanvas, note ? [] : this.scopeSpecDepth(), {
         emptyLabel: note || empty,
-        domain: [2, 8],
+        domain: sdDomain,
       });
     }
 
@@ -1849,7 +1862,7 @@ export class AnalyticsComponent implements OnInit, OnDestroy {
         const regNote = v.clusters.total === 0 ? 'no latency data' : v.split == null ? 'No bimodal split detected.' : '';
         this.charts.drawCategoryBars(sc, regNote ? [] : v.specDepth, {
           emptyLabel: regNote || empty,
-          domain: [2, 8],
+          domain: sdDomain,
         });
       }
     }

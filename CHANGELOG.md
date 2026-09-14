@@ -3,6 +3,16 @@
 High-level release notes for VeloBenchmark. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## v0.2.1 — Report & chart polish, instant Stop
+
+- **Instant Stop.** Cancelled turns now finalize via fast estimates, so **Stop acknowledges
+  immediately** instead of waiting on the stream to wind down.
+- **Charts.** The Decode-rate timeline y-axis now follows the visible values (±5%), and
+  speculation-depth charts size their slots to the observed data.
+- **Concurrent reports.** The header shows the run label; the compact per-turn timings are merged into
+  one table showing only the Σ/avg rows.
+- Minor bug fixes and optimizations.
+
 ## v0.2.0 — Responsive UX, reports & exports, result validity, benchmarking rigor
 
 A large feature release: eight workstreams (M1–M8) covering the whole tool.

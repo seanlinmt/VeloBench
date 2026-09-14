@@ -17,8 +17,6 @@ import type { LatencyCluster, LatencyClusterResult } from '../types';
  */
 
 const MIN_SPLIT_MS = 1.0;
-/** Runs of consecutive low-latency gaps longer than this are capped (stats.rs). */
-export const MAX_SPEC_DEPTH = 8;
 
 function emptyResult(total: number): LatencyClusterResult {
   return { bimodal: false, split: 0, eta: 0, clusters: [], total };
@@ -221,7 +219,8 @@ export function acceptanceSeries(
 /**
  * Speculation depth distribution — port of the spec-depth block in
  * stats.rs `recompute_analytics`: runs of >= 2 consecutive low-latency gaps,
- * counted per run length and capped at MAX_SPEC_DEPTH, sorted by depth.
+ * counted per run length, sorted by depth. No fixed cap — charts derive
+ * their slot count from the observed depths (specDepthDomain).
  */
 export function specDepthSeries(gaps: Array<{ dt: number }>, split: number): Array<{ depth: number; count: number }> {
   const depthCounts = new Map<number, number>();
@@ -240,10 +239,28 @@ export function specDepthSeries(gaps: Array<{ dt: number }>, split: number): Arr
   bump(run);
   const out: Array<{ depth: number; count: number }> = [];
   for (const [depth, count] of depthCounts) {
-    if (depth <= MAX_SPEC_DEPTH) out.push({ depth, count });
+    out.push({ depth, count });
   }
   out.sort((a, b) => a.depth - b.depth);
   return out;
+}
+
+/**
+ * Shared X domain for speculation-depth charts: slots start at 2 (a run is at
+ * least two low-latency gaps) and end at the deepest run observed across the
+ * given series — one column per integer depth, so the slot count is dynamic.
+ * Returns undefined when every series is empty, letting the chart show its
+ * empty-state label instead of a meaningless axis. Charts that must stay
+ * comparable (report scope + regimes, compare A/B) pass one shared result.
+ */
+export function specDepthDomain(
+  ...series: Array<Array<{ depth: number }>>
+): [number, number] | undefined {
+  let max = 0;
+  for (const s of series) {
+    for (const p of s) if (p.depth > max) max = p.depth;
+  }
+  return max >= 2 ? [2, max] : undefined;
 }
 
 /** Robust percentile (ws.rs): value at `floor-rounded ((len-1)*p)` of a sorted copy. */

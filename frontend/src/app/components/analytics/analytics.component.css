@@ -658,3 +658,11 @@ table.bins td.num, table.bins th.num { text-align: right; font-family: ui-monosp
   color: #f87171;
   border-color: rgba(228, 99, 107, 0.4);
 }
+
+/* Merged per-turn table (compact concurrent report): the step title column. */
+.ttable .step-col {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

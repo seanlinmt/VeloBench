@@ -71,7 +71,7 @@
           }
         </div>
         <div class="session-name-line">
-          <span class="session-name" [title]="sessionName() ? 'session ' + d.session : ''">{{ sessionName() || 'Session ' + d.session.slice(0, 8) }}</span>
+          <span class="session-name" [title]="'session ' + d.session">{{ displayTitle() || 'Session ' + d.session.slice(0, 8) }}</span>
           @if (sessionCat()) {
             <span class="badge cat" title="Managed category">{{ sessionCat() }}</span>
           }
@@ -215,14 +215,18 @@
 
       @if (turnRows().length > 1) {
 @if (conc()) {
-            @for (g of turnGroups(); track g.name) {
-              <div class="card turntable-card">
-                <div class="chart-head"><h4>{{ g.name }}</h4><span class="chart-unit">barrier step · one request per worker ({{ g.rows.length }}) · Σ / avg = step total</span></div>
-                <table class="ttable">
-                  <thead><tr><th>Worker</th><th class="num">Input tok</th><th>Output tok</th><th>Total tok</th><th>TTFT</th><th title="prompt tokens ÷ TTFT — an end-to-end estimate, not a measured server prefill rate">Prompt tok/s (TTFT est.)</th><th class="num">Med tok/s</th><th class="num">Med tok/s (aggr.)</th><th class="num">Min</th><th class="num">Max</th><th class="num">α̂ avg</th><th class="num">Depth avg</th></tr></thead>
-                  <tbody>
+            <!-- Owner request: one merged table instead of one box per barrier
+                 step — the step title is the first column, every request is a
+                 row, and each step ends with its Σ / avg. -->
+            <div class="card turntable-card">
+              <div class="chart-head"><h4>Per-turn timings</h4><span class="chart-unit">Σ / avg per barrier step · first column = the step (per-request rows live on the Analytics tab)</span></div>
+              <table class="ttable">
+                <thead><tr><th>Step</th><th>Worker</th><th class="num">Input tok</th><th>Output tok</th><th>Total tok</th><th>TTFT</th><th title="prompt tokens ÷ TTFT — an end-to-end estimate, not a measured server prefill rate">Prompt tok/s (TTFT est.)</th><th class="num">Med tok/s</th><th class="num">Med tok/s (aggr.)</th><th class="num">Min</th><th class="num">Max</th><th class="num">α̂ avg</th><th class="num">Depth avg</th></tr></thead>
+                <tbody>
+                  @for (g of turnGroups(); track g.name) {
                     @if (g.agg; as ga) {
                       <tr class="agg-row">
+                        <td class="mono" [title]="g.name">{{ g.name }}</td>
                         <td class="mono">Σ / avg</td>
                         <td class="mono">{{ fmtInt(ga.input) }}</td>
                         <td class="mono">{{ fmtInt(ga.out) }}</td>
@@ -237,10 +241,10 @@
                         <td class="mono">{{ ga.depth == null ? '—' : ga.depth.toFixed(1) }}</td>
                       </tr>
                     }
-                  </tbody>
-                </table>
-              </div>
-            }
+                  }
+                </tbody>
+              </table>
+            </div>
           } @else {
         <div class="card turntable-card">
           <div class="chart-head"><h4>Per-turn timings</h4><span class="chart-unit">sent = tokens the model received for that turn (incl. conversation history)</span></div>

@@ -207,32 +207,6 @@ export class StatsPanelComponent implements OnInit, AfterViewInit {
     this.tokensPerReq.set(tok);
   }
 
-  /**
-   * Rolling robust y-domain (§10): rebuilt from the p02..p98 band only when
-   * the data materially outgrows it, so the axis does not rescale on every
-   * frame during a run.
-   */
-  private rateDomain: { min: number; max: number } | null = null;
-  private stableDomain(samples: LiveSample[]): { min: number; max: number } | null {
-    const rates = samples.map((s) => s.tok_s).filter((v) => v > 0).sort((a, b) => a - b);
-    if (rates.length < 8) {
-      this.rateDomain = null;
-      return null;
-    }
-    const p2 = rates[Math.floor(rates.length * 0.02)];
-    const p98 = rates[Math.floor(rates.length * 0.98)];
-    const vmax = rates[rates.length - 1];
-    const dom = this.rateDomain;
-    // Dynamic fit: re-scale whenever ANY sample would draw outside the current
-    // domain (spikes must not clip); between those moments the axis stays
-    // stable so a run doesn't jitter.
-    if (!dom || vmax > dom.max) {
-      const base = Math.max(p98, vmax);
-      this.rateDomain = { min: 0, max: base + Math.max((base - p2) * 0.15, 2) };
-    }
-    return this.rateDomain;
-  }
-
   private redraw(): void {
     if (!this.ready) return;
     const samples = this.visibleSamples();
@@ -263,7 +237,6 @@ export class StatsPanelComponent implements OnInit, AfterViewInit {
         showStatLines: true,
         tintBackground: true,
         medianColor: '#4C86FF',
-        fixedDomain: this.stableDomain(samples),
         endLabel: true,
         emptyLabel,
       });
@@ -325,7 +298,6 @@ export class StatsPanelComponent implements OnInit, AfterViewInit {
     if (sdCanvas) {
       this.charts.drawCategoryBars(sdCanvas, specNote ? [] : this.engine.aggSpecDepth(), {
         emptyLabel: specNote ?? emptyLabel,
-        domain: [2, 8],
       });
     }
     this.labelCanvases();

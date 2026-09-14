@@ -974,7 +974,13 @@ async fn run_step(
     // Finalise — including a Stop: the partial output is recorded with its
     // cancelled state so the report shows what actually happened (a stopped
     // run is data, not a silent gap).
-    let gen = engine.finish_exact(&st.http, handle.as_deref(), now_ms()).await;
+    // A Stop must acknowledge fast: cancelled partials skip the per-chunk
+    // exact counting (a looping generation holds thousands of chunks).
+    let gen = if stopped {
+        engine.finish(now_ms())
+    } else {
+        engine.finish_exact(&st.http, handle.as_deref(), now_ms()).await
+    };
     let final_tok_s = Some(gen.final_tok_s);
     let completion = gen.completion_tokens;
     let ttft = gen.ttft_ms;

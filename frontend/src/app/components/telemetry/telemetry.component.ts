@@ -188,7 +188,6 @@ export class TelemetryComponent implements OnInit, OnDestroy {
     if (sd) {
       this.charts.drawCategoryBars(sd, specNote ? [] : p.specDepth, {
         emptyLabel: specNote ?? emptyLabel,
-        domain: [2, 8],
       });
     }
   }
