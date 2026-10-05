@@ -213,12 +213,26 @@ impl Stream {
         self.window_buf.push_str(content);
         if self.text.len() > TEXT_CAP_CHARS {
             // Drop the head at a line boundary to keep the window intact.
-            let cut = self.text.len() - TEXT_CAP_CHARS;
+            let mut cut = self.text.len() - TEXT_CAP_CHARS;
+            while cut < self.text.len() && !self.text.is_char_boundary(cut) {
+                cut += 1;
+            }
             let safe = self.text[cut..]
                 .find('\n')
                 .map(|i| cut + i + 1)
                 .unwrap_or(cut);
             self.text = self.text[safe..].to_string();
+        }
+        if self.window_buf.len() > TEXT_CAP_CHARS {
+            let mut cut = self.window_buf.len() - TEXT_CAP_CHARS;
+            while cut < self.window_buf.len() && !self.window_buf.is_char_boundary(cut) {
+                cut += 1;
+            }
+            let safe = self.window_buf[cut..]
+                .find('\n')
+                .map(|i| cut + i + 1)
+                .unwrap_or(cut);
+            self.window_buf = self.window_buf[safe..].to_string();
         }
     }
 
@@ -276,12 +290,12 @@ pub async fn ingest_logs(st: &AppState, body: &Value) -> usize {
     let mut new_status: Option<StatusLine> = None;
     let mut to_save: Vec<String> = Vec::new();
     {
-        let mut streams = st.telemetry.streams.lock().unwrap();
+        let mut streams = st.telemetry.streams.lock().unwrap_or_else(|e| e.into_inner());
         for rec in &records {
             ingested += 1;
             {
                 let seq = st.telemetry.raw_seq.fetch_add(1, Ordering::Relaxed);
-                let mut raw = st.telemetry.raw.lock().unwrap();
+                let mut raw = st.telemetry.raw.lock().unwrap_or_else(|e| e.into_inner());
                 raw.push_back(json!({ "seq": seq, "t": now, "rec": rec }));
                 while raw.len() > RAW_CAP {
                     raw.pop_front();
@@ -464,7 +478,7 @@ pub async fn ingest_logs(st: &AppState, body: &Value) -> usize {
             to_save.extend(expired);
         }
         if let Some(stt) = new_status {
-            *st.telemetry.status.lock().unwrap() = Some(stt);
+            *st.telemetry.status.lock().unwrap_or_else(|e| e.into_inner()) = Some(stt);
         }
     }
     for rid in to_save {
@@ -570,19 +584,19 @@ pub async fn tick_frame(
     let settings = st.store.settings().await;
     let cfg = settings.telemetry.clone();
     let now = now_ms();
-    let streams = st.telemetry.streams.lock().unwrap();
+    let streams = st.telemetry.streams.lock().unwrap_or_else(|e| e.into_inner());
     let mut next_cursors = std::collections::HashMap::new();
     let mut out = Vec::with_capacity(streams.len());
     for s in streams.iter() {
-        let mut buf = s.window_buf.clone();
-        trim_window(&mut buf, cfg.chat_lines);
         let cur = cursors.get(&s.request_id).copied().unwrap_or(0);
-        let (full, delta) = if cur == 0 || cur > buf.len() {
-            (true, String::new())
+        let (full, delta, text) = if cur == 0 || cur > s.window_buf.len() || !s.window_buf.is_char_boundary(cur) {
+            let mut buf = s.window_buf.clone();
+            trim_window(&mut buf, cfg.chat_lines);
+            (true, String::new(), buf)
         } else {
-            (false, buf[cur..].to_string())
+            (false, s.window_buf[cur..].to_string(), String::new())
         };
-        next_cursors.insert(s.request_id.clone(), buf.len());
+        next_cursors.insert(s.request_id.clone(), s.window_buf.len());
 
         let live = s.engine.live();
         let a = s.engine.analytics();
@@ -629,7 +643,7 @@ pub async fn tick_frame(
             "finishReason": s.finish_reason,
             "full": full,
             "delta": delta,
-            "text": if full { buf.clone() } else { String::new() },
+            "text": text,
             "stats": {
                 "tokS": live.tok_s,
                 "tokens": live.tokens,
@@ -661,7 +675,7 @@ pub async fn tick_frame(
     json!({
         "type": "tick",
         "t": now,
-        "status": st.telemetry.status.lock().unwrap().clone().map(|s0| json!({ "model": s0.model, "topology": s0.topology })),
+        "status": st.telemetry.status.lock().unwrap_or_else(|e| e.into_inner()).clone().map(|s0| json!({ "model": s0.model, "topology": s0.topology })),
         "clientConnected": st.telemetry.client_connected(),
         "metricPoints": st.telemetry.metric_points.load(Ordering::Relaxed),
         "config": {
@@ -682,7 +696,7 @@ pub async fn tick_frame(
 /// returns only newer records (empty when the client is in sync) plus the
 /// newest seq, so the UI polls incrementally instead of re-pulling the buffer.
 pub fn raw(st: &AppState, since: u64) -> Value {
-    let raw = st.telemetry.raw.lock().unwrap();
+    let raw = st.telemetry.raw.lock().unwrap_or_else(|e| e.into_inner());
     let records: Vec<&Value> = raw
         .iter()
         .filter(|r| r.get("seq").and_then(|v| v.as_u64()).map(|q| q > since).unwrap_or(true))
@@ -699,10 +713,12 @@ pub fn raw(st: &AppState, since: u64) -> Value {
 /// first) with sliding-window text, live stats and recording state.
 pub async fn snapshot(st: &AppState) -> Value {
     let cfg = st.store.settings().await.telemetry;
-    let streams = st.telemetry.streams.lock().unwrap();
+    let streams = st.telemetry.streams.lock().unwrap_or_else(|e| e.into_inner());
     let mut panels: Vec<Value> = streams
         .iter()
         .map(|s| {
+            let mut text = s.window_buf.clone();
+            trim_window(&mut text, cfg.chat_lines);
             let live = s.engine.live();
             let samples = &s.engine.analytics().samples;
             let series: Vec<Value> = samples
@@ -721,7 +737,7 @@ pub async fn snapshot(st: &AppState) -> Value {
                 "finishReason": s.finish_reason,
                 "startedMs": s.started_ms,
                 "lastMs": s.last_ms,
-                "text": s.window_buf,
+                "text": text,
                 "stats": {
                     "tokS": live.tok_s,
                     "tokens": live.tokens,
@@ -750,7 +766,7 @@ pub async fn snapshot(st: &AppState) -> Value {
     });
     panels.truncate(cfg.max_streams.max(1));
 
-    let status = st.telemetry.status.lock().unwrap().clone();
+    let status = st.telemetry.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
     json!({
         "clientConnected": st.telemetry.client_connected(),
         "metricPoints": st.telemetry.metric_points.load(Ordering::Relaxed),
@@ -773,7 +789,7 @@ pub async fn snapshot(st: &AppState) -> Value {
 /// recording.
 pub async fn record_start(st: &AppState, request_id: &str) -> Result<(), String> {
     let settings = st.store.settings().await;
-    let mut streams = st.telemetry.streams.lock().unwrap();
+    let mut streams = st.telemetry.streams.lock().unwrap_or_else(|e| e.into_inner());
     let s = streams
         .iter_mut()
         .find(|s| s.request_id == request_id)
@@ -798,7 +814,7 @@ pub async fn record_stop(st: &AppState, request_id: &str) -> Result<String, Stri
         .telemetry
         .streams
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .any(|s| s.request_id == request_id && s.recording.is_some());
     if !active {
@@ -812,7 +828,7 @@ pub async fn record_stop(st: &AppState, request_id: &str) -> Result<String, Stri
 async fn finalize_recording(st: &AppState, request_id: &str, _why: &str) -> Result<String, String> {
     let now = now_ms();
     let (session, label) = {
-        let mut streams = st.telemetry.streams.lock().unwrap();
+        let mut streams = st.telemetry.streams.lock().unwrap_or_else(|e| e.into_inner());
         let Some(s) = streams.iter_mut().find(|s| s.request_id == request_id) else {
             return Err("unknown stream".into());
         };
@@ -935,27 +951,27 @@ impl Listener {
     fn running_at(&self, host: &str, port: u16) -> bool {
         self.inner
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|(h, p, _)| h == host && *p == port)
             .unwrap_or(false)
     }
 
     fn take(&self) -> Option<ListenerHandle> {
-        self.inner.lock().unwrap().take().map(|(_, _, h)| h)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).take().map(|(_, _, h)| h)
     }
 
     fn store(&self, host: &str, port: u16, handle: ListenerHandle) {
-        *self.inner.lock().unwrap() = Some((host.to_string(), port, handle));
+        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = Some((host.to_string(), port, handle));
     }
 }
 
 /// Drop all open stream panels + the status line. Used when the receiver is
 /// turned off and by the UI's clear button; new messages reopen panels.
 pub fn clear(st: &AppState) {
-    st.telemetry.streams.lock().unwrap().clear();
-    st.telemetry.raw.lock().unwrap().clear();
-    *st.telemetry.status.lock().unwrap() = None;
+    st.telemetry.streams.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    st.telemetry.raw.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *st.telemetry.status.lock().unwrap_or_else(|e| e.into_inner()) = None;
     st.telemetry.last_post_ms.store(0, Ordering::Relaxed);
     st.telemetry.metric_points.store(0, Ordering::Relaxed);
 }
@@ -1064,7 +1080,7 @@ pub async fn simulate(st: AppState, streams: u32, tokens: u32) {
                     "resource_logs": [ { "scope_logs": [ { "log_records": records } ] } ]
                 })).send().await;
                 // stop early if the panel is gone
-                if st2.telemetry.streams.lock().unwrap().iter().all(|s| s.request_id != rid) && k > 5 {
+                if st2.telemetry.streams.lock().unwrap_or_else(|e| e.into_inner()).iter().all(|s| s.request_id != rid) && k > 5 {
                     break;
                 }
             }
@@ -1072,5 +1088,154 @@ pub async fn simulate(st: AppState, streams: u32, tokens: u32) {
                 "resource_logs": [ { "scope_logs": [ { "log_records": [ rec(now_ms(), "stream_end", tokens + 1, "", Some("stop")) ] } ] } ]
             })).send().await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_app_state() -> AppState {
+        let tmp = std::env::temp_dir().join(format!("velobench_test_{}", uuid::Uuid::new_v4()));
+        let store = crate::state::Store::new(tmp).await.unwrap();
+        let http = reqwest::Client::new();
+        AppState {
+            store,
+            http: std::sync::Arc::new(http),
+            stats: std::sync::Arc::new(tokio::sync::Mutex::new(crate::stats::StatsEngine::new())),
+            analyzing: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            tokenizers: std::sync::Arc::new(crate::tokenizer::TokenizerCache::new()),
+            calibrations: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            corpus: std::sync::Arc::new(crate::corpus::CorpusCache::new()),
+            conc: std::sync::Arc::new(crate::concurrent::ConcRegistry::new()),
+            cancels: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            live_runs: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            active_session: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            telemetry: std::sync::Arc::new(TelemetryHub::new()),
+        }
+    }
+
+    #[test]
+    fn append_text_handles_multibyte_utf8_char_boundaries() {
+        let mut s = Stream {
+            request_id: "test-req".into(),
+            generation_id: "".into(),
+            model: "test-model".into(),
+            topology: "test-topo".into(),
+            started_ms: 0.0,
+            last_ms: 0.0,
+            done: false,
+            finish_reason: None,
+            text: String::new(),
+            window_buf: String::new(),
+            engine: fresh_engine(100, 100.0, 1000, 1.0),
+            recording: None,
+        };
+
+        // Fill with multibyte characters (e.g. '§' which is 2 bytes: 0xC2, 0xA7)
+        let chunk = "§\n".repeat(TEXT_CAP_CHARS / 2 + 100);
+        s.append_text(&chunk);
+        assert!(s.text.len() <= TEXT_CAP_CHARS + 10);
+        assert!(s.window_buf.len() <= TEXT_CAP_CHARS + 10);
+        assert!(s.text.is_char_boundary(s.text.len()));
+        assert!(s.window_buf.is_char_boundary(s.window_buf.len()));
+    }
+
+    #[tokio::test]
+    async fn tick_frame_cursor_survives_multibyte_and_trimming() {
+        let st = test_app_state().await;
+
+        let rid = "req-1";
+        {
+            let mut streams = st.telemetry.streams.lock().unwrap();
+            streams.push(Stream {
+                request_id: rid.into(),
+                generation_id: "".into(),
+                model: "model".into(),
+                topology: "tp".into(),
+                started_ms: 100.0,
+                last_ms: 100.0,
+                done: false,
+                finish_reason: None,
+                text: String::new(),
+                window_buf: String::new(),
+                engine: fresh_engine(100, 100.0, 1000, 1.0),
+                recording: None,
+            });
+        }
+
+        let mut cursors = std::collections::HashMap::new();
+
+        // 1. Initial tick when empty
+        let f1 = tick_frame(&st, &mut cursors).await;
+        assert_eq!(f1["type"], "tick");
+
+        // 2. Append lines containing multibyte '§' characters
+        {
+            let mut streams = st.telemetry.streams.lock().unwrap();
+            let s = &mut streams[0];
+            for i in 0..100 {
+                s.append_text(&format!("line {}: § test data §\n", i));
+            }
+        }
+
+        // 3. Second tick: first non-empty frame for connection sends full=true and initial text
+        let f2 = tick_frame(&st, &mut cursors).await;
+        let s2 = &f2["streams"][0];
+        assert_eq!(s2["full"], true);
+        assert!(!s2["text"].as_str().unwrap().is_empty());
+
+        // 4. Append more lines to exceed default chat_lines window
+        {
+            let mut streams = st.telemetry.streams.lock().unwrap();
+            let s = &mut streams[0];
+            for i in 100..200 {
+                s.append_text(&format!("line {}: § more tokens §\n", i));
+            }
+        }
+
+        // 5. Third tick: should deliver incremental delta cleanly without char boundary panic
+        let f3 = tick_frame(&st, &mut cursors).await;
+        let s3 = &f3["streams"][0];
+        assert_eq!(s3["full"], false);
+        assert!(!s3["delta"].as_str().unwrap().is_empty());
+
+        // 6. Append another batch of lines with '§'
+        {
+            let mut streams = st.telemetry.streams.lock().unwrap();
+            let s = &mut streams[0];
+            for i in 200..300 {
+                s.append_text(&format!("line {}: § even more §\n", i));
+            }
+        }
+
+        // 7. Fourth tick: should continue delivering deltas
+        let f4 = tick_frame(&st, &mut cursors).await;
+        let s4 = &f4["streams"][0];
+        assert_eq!(s4["full"], false);
+        assert!(!s4["delta"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn poisoned_streams_mutex_recovers_without_panic() {
+        let st = test_app_state().await;
+
+        // Deliberately poison the streams mutex
+        let hub = st.telemetry.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = hub.streams.lock().unwrap();
+            panic!("deliberate panic to poison streams mutex");
+        }));
+
+        assert!(st.telemetry.streams.is_poisoned());
+
+        // Calling tick_frame should recover the poisoned mutex instead of panicking
+        let mut cursors = std::collections::HashMap::new();
+        let f = tick_frame(&st, &mut cursors).await;
+        assert_eq!(f["type"], "tick");
+
+        // Calling snapshot should also recover without panic
+        let snap = snapshot(&st).await;
+        assert!(snap.get("streams").is_some());
     }
 }
