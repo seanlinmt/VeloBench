@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -45,6 +45,27 @@ fn now_ms() -> f64 {
         .as_millis() as f64
 }
 
+/// Lock a telemetry mutex, recovering from poisoning. A handler that panics
+/// while holding one of these locks must not wedge the receiver for the rest
+/// of the process lifetime (every later lock would otherwise fail and the UI
+/// reports the receiver as OFF until a restart). The state behind these locks
+/// is display-only, so carrying on with it is safe; the poison is cleared and
+/// logged once so the underlying panic stays visible.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| {
+        tracing::warn!("telemetry: recovering a poisoned lock (a handler panicked while holding it)");
+        m.clear_poison();
+        e.into_inner()
+    })
+}
+
+/// Source of unique per-`Stream` epochs (see `Stream::epoch`).
+static NEXT_STREAM_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Per-WebSocket-connection delivery cursors: `request.id` → (stream epoch,
+/// absolute byte offset into that stream's output already delivered).
+pub type Cursors = std::collections::HashMap<String, (u64, usize)>;
+
 /// One live generation stream (one panel).
 pub struct Stream {
     pub request_id: String,
@@ -55,12 +76,18 @@ pub struct Stream {
     pub last_ms: f64,
     pub done: bool,
     pub finish_reason: Option<String>,
-    /// Accumulated output text (memory-capped; head dropped at line breaks).
-    pub text: String,
-    /// Sliding window (last `chat_lines` lines) maintained incrementally —
-    /// what gets pushed to the UI, delta-style, exactly like the chat page
-    /// pushes the transcript.
+    /// Unique per `Stream` instance, so a WebSocket cursor taken against an
+    /// evicted stream is never applied to a new stream with the same id.
+    pub epoch: u64,
+    /// Tail of the stream's output (byte-capped at `WINDOW_CAP_BYTES`, head
+    /// dropped at line breaks) — what gets pushed to the UI, delta-style,
+    /// exactly like the chat page pushes the transcript. Full resyncs send its
+    /// last `chat_lines` lines.
     pub window_buf: String,
+    /// Bytes ever dropped from the head of `window_buf`. `window_base +
+    /// window_buf.len()` is the absolute (append-only) output offset, which is
+    /// what delivery cursors track — so head-trimming never shifts them.
+    pub window_base: usize,
     /// Same live-stats engine the chat page uses — identical numbers.
     pub engine: StatsEngine,
     pub recording: Option<Recording>,
@@ -205,44 +232,60 @@ fn nanos_to_ms(v: Option<&Value>) -> Option<f64> {
     Some(n as f64 / 1_000_000.0)
 }
 
-const TEXT_CAP_CHARS: usize = 400_000;
+/// Byte cap for `Stream::window_buf`. The UI keeps ~10-12K chars per panel
+/// and a full resync sends at most `chat_lines` lines, so 64 KiB is ample.
+const WINDOW_CAP_BYTES: usize = 64 * 1024;
+/// Once over the cap, trim down to this, so the O(len) head drain is paid
+/// once per ~16 KiB of output instead of on every token.
+const WINDOW_TRIM_TO_BYTES: usize = WINDOW_CAP_BYTES * 3 / 4;
+/// How far past the byte cut we look for a newline to trim at a line start.
+const LINE_SNAP_BYTES: usize = 4 * 1024;
+
+/// Smallest char boundary of `s` at or after `i` (clamped to `s.len()`).
+fn ceil_boundary(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i.min(s.len())
+}
 
 impl Stream {
-    fn append_text(&mut self, content: &str) {
-        self.text.push_str(content);
-        self.window_buf.push_str(content);
-        if self.text.len() > TEXT_CAP_CHARS {
-            // Drop the head at a line boundary to keep the window intact.
-            let mut cut = self.text.len() - TEXT_CAP_CHARS;
-            while cut < self.text.len() && !self.text.is_char_boundary(cut) {
-                cut += 1;
-            }
-            let safe = self.text[cut..]
-                .find('\n')
-                .map(|i| cut + i + 1)
-                .unwrap_or(cut);
-            self.text = self.text[safe..].to_string();
-        }
-        if self.window_buf.len() > TEXT_CAP_CHARS {
-            let mut cut = self.window_buf.len() - TEXT_CAP_CHARS;
-            while cut < self.window_buf.len() && !self.window_buf.is_char_boundary(cut) {
-                cut += 1;
-            }
-            let safe = self.window_buf[cut..]
-                .find('\n')
-                .map(|i| cut + i + 1)
-                .unwrap_or(cut);
-            self.window_buf = self.window_buf[safe..].to_string();
+    fn new(request_id: String, generation_id: String, model: String, topology: String, ts: f64, engine: StatsEngine) -> Self {
+        Stream {
+            request_id,
+            generation_id,
+            model,
+            topology,
+            started_ms: ts,
+            last_ms: ts,
+            done: false,
+            finish_reason: None,
+            epoch: NEXT_STREAM_EPOCH.fetch_add(1, Ordering::Relaxed),
+            window_buf: String::new(),
+            window_base: 0,
+            engine,
+            recording: None,
         }
     }
 
-    /// The mini-chat sliding window: the last `lines` lines of output.
-    pub fn window(&self, lines: usize) -> String {
-        if self.text.lines().count() <= lines {
-            return self.text.clone();
+    /// Absolute output offset just past the newest byte (append-only).
+    fn window_end(&self) -> usize {
+        self.window_base + self.window_buf.len()
+    }
+
+    fn append_text(&mut self, content: &str) {
+        self.window_buf.push_str(content);
+        if self.window_buf.len() > WINDOW_CAP_BYTES {
+            let cut = ceil_boundary(&self.window_buf, self.window_buf.len() - WINDOW_TRIM_TO_BYTES);
+            // Prefer starting the window on a whole line, if one starts soon.
+            let cut = self.window_buf[cut..]
+                .find('\n')
+                .filter(|&i| i < LINE_SNAP_BYTES)
+                .map(|i| cut + i + 1)
+                .unwrap_or(cut);
+            self.window_buf.drain(..cut);
+            self.window_base += cut;
         }
-        let start = self.text.lines().count() - lines;
-        self.text.lines().skip(start).collect::<Vec<_>>().join("\n")
     }
 }
 
@@ -290,12 +333,12 @@ pub async fn ingest_logs(st: &AppState, body: &Value) -> usize {
     let mut new_status: Option<StatusLine> = None;
     let mut to_save: Vec<String> = Vec::new();
     {
-        let mut streams = st.telemetry.streams.lock().unwrap_or_else(|e| e.into_inner());
+        let mut streams = lock(&st.telemetry.streams);
         for rec in &records {
             ingested += 1;
             {
                 let seq = st.telemetry.raw_seq.fetch_add(1, Ordering::Relaxed);
-                let mut raw = st.telemetry.raw.lock().unwrap_or_else(|e| e.into_inner());
+                let mut raw = lock(&st.telemetry.raw);
                 raw.push_back(json!({ "seq": seq, "t": now, "rec": rec }));
                 while raw.len() > RAW_CAP {
                     raw.pop_front();
@@ -394,20 +437,14 @@ pub async fn ingest_logs(st: &AppState, body: &Value) -> usize {
                                 .unwrap_or(0);
                             streams.remove(victim);
                         }
-                        streams.push(Stream {
-                            request_id: rid.clone(),
-                            generation_id: gen_id,
-                            model: model.clone(),
-                            topology: topology.clone(),
-                            started_ms: ts,
-                            last_ms: ts,
-                            done: false,
-                            finish_reason: None,
-                            text: String::new(),
-                            window_buf: String::new(),
-                            engine: fresh_engine(settings.max_graph_points, settings.intra_token_latency_split_cap_ms, stats_budget, live_ratio_for(&settings, &model)),
-                            recording: None,
-                        });
+                        streams.push(Stream::new(
+                            rid.clone(),
+                            gen_id,
+                            model.clone(),
+                            topology.clone(),
+                            ts,
+                            fresh_engine(settings.max_graph_points, settings.intra_token_latency_split_cap_ms, stats_budget, live_ratio_for(&settings, &model)),
+                        ));
                     }
                 }
                 "stream_delta" => {
@@ -478,7 +515,7 @@ pub async fn ingest_logs(st: &AppState, body: &Value) -> usize {
             to_save.extend(expired);
         }
         if let Some(stt) = new_status {
-            *st.telemetry.status.lock().unwrap_or_else(|e| e.into_inner()) = Some(stt);
+            *lock(&st.telemetry.status) = Some(stt);
         }
     }
     for rid in to_save {
@@ -575,28 +612,37 @@ fn trim_window(buf: &mut String, lines: usize) {
 /// The push frame for the Telemetry WebSocket — the telemetry analogue of the
 /// chat page's stream-delta + stats frames. ALL numbers are computed here,
 /// server-side (same StatsEngine as chat). `cursors` tracks, per connection,
-/// how much of each stream's window was already delivered → only deltas go
-/// over the wire; `full` makes the client resync its text.
-pub async fn tick_frame(
-    st: &AppState,
-    cursors: &mut std::collections::HashMap<String, usize>,
-) -> Value {
+/// how much of each stream's output was already delivered (absolute offset,
+/// tagged with the stream's epoch) → only deltas go over the wire; `full`
+/// makes the client resync its text (first sight of a stream, or a cursor
+/// that fell behind the trimmed window).
+pub async fn tick_frame(st: &AppState, cursors: &mut Cursors) -> Value {
     let settings = st.store.settings().await;
     let cfg = settings.telemetry.clone();
     let now = now_ms();
-    let streams = st.telemetry.streams.lock().unwrap_or_else(|e| e.into_inner());
-    let mut next_cursors = std::collections::HashMap::new();
+    let streams = lock(&st.telemetry.streams);
+    let mut next_cursors = Cursors::new();
     let mut out = Vec::with_capacity(streams.len());
     for s in streams.iter() {
-        let cur = cursors.get(&s.request_id).copied().unwrap_or(0);
-        let (full, delta, text) = if cur == 0 || cur > s.window_buf.len() || !s.window_buf.is_char_boundary(cur) {
-            let mut buf = s.window_buf.clone();
-            trim_window(&mut buf, cfg.chat_lines);
-            (true, String::new(), buf)
-        } else {
-            (false, s.window_buf[cur..].to_string(), String::new())
+        let (start, end) = (s.window_base, s.window_end());
+        let resume = match cursors.get(&s.request_id) {
+            Some(&(epoch, c)) if epoch == s.epoch && c >= start && c <= end => {
+                let rel = c - start;
+                // Cursors only ever land on append boundaries, which are char
+                // boundaries; checked anyway so a logic slip can't panic.
+                s.window_buf.is_char_boundary(rel).then_some(rel)
+            }
+            _ => None,
         };
-        next_cursors.insert(s.request_id.clone(), s.window_buf.len());
+        let (full, delta, text) = match resume {
+            Some(rel) => (false, s.window_buf[rel..].to_string(), String::new()),
+            None => {
+                let mut buf = s.window_buf.clone();
+                trim_window(&mut buf, cfg.chat_lines);
+                (true, String::new(), buf)
+            }
+        };
+        next_cursors.insert(s.request_id.clone(), (s.epoch, end));
 
         let live = s.engine.live();
         let a = s.engine.analytics();
@@ -675,7 +721,7 @@ pub async fn tick_frame(
     json!({
         "type": "tick",
         "t": now,
-        "status": st.telemetry.status.lock().unwrap_or_else(|e| e.into_inner()).clone().map(|s0| json!({ "model": s0.model, "topology": s0.topology })),
+        "status": lock(&st.telemetry.status).clone().map(|s0| json!({ "model": s0.model, "topology": s0.topology })),
         "clientConnected": st.telemetry.client_connected(),
         "metricPoints": st.telemetry.metric_points.load(Ordering::Relaxed),
         "config": {
@@ -696,7 +742,7 @@ pub async fn tick_frame(
 /// returns only newer records (empty when the client is in sync) plus the
 /// newest seq, so the UI polls incrementally instead of re-pulling the buffer.
 pub fn raw(st: &AppState, since: u64) -> Value {
-    let raw = st.telemetry.raw.lock().unwrap_or_else(|e| e.into_inner());
+    let raw = lock(&st.telemetry.raw);
     let records: Vec<&Value> = raw
         .iter()
         .filter(|r| r.get("seq").and_then(|v| v.as_u64()).map(|q| q > since).unwrap_or(true))
@@ -713,7 +759,7 @@ pub fn raw(st: &AppState, since: u64) -> Value {
 /// first) with sliding-window text, live stats and recording state.
 pub async fn snapshot(st: &AppState) -> Value {
     let cfg = st.store.settings().await.telemetry;
-    let streams = st.telemetry.streams.lock().unwrap_or_else(|e| e.into_inner());
+    let streams = lock(&st.telemetry.streams);
     let mut panels: Vec<Value> = streams
         .iter()
         .map(|s| {
@@ -766,7 +812,7 @@ pub async fn snapshot(st: &AppState) -> Value {
     });
     panels.truncate(cfg.max_streams.max(1));
 
-    let status = st.telemetry.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let status = lock(&st.telemetry.status).clone();
     json!({
         "clientConnected": st.telemetry.client_connected(),
         "metricPoints": st.telemetry.metric_points.load(Ordering::Relaxed),
@@ -789,7 +835,7 @@ pub async fn snapshot(st: &AppState) -> Value {
 /// recording.
 pub async fn record_start(st: &AppState, request_id: &str) -> Result<(), String> {
     let settings = st.store.settings().await;
-    let mut streams = st.telemetry.streams.lock().unwrap_or_else(|e| e.into_inner());
+    let mut streams = lock(&st.telemetry.streams);
     let s = streams
         .iter_mut()
         .find(|s| s.request_id == request_id)
@@ -810,11 +856,7 @@ pub async fn record_start(st: &AppState, request_id: &str) -> Result<(), String>
 /// Stop (and save) a recording for a stream. Saving is idempotent-ish: a
 /// stream without an active recording is a no-op error.
 pub async fn record_stop(st: &AppState, request_id: &str) -> Result<String, String> {
-    let active = st
-        .telemetry
-        .streams
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let active = lock(&st.telemetry.streams)
         .iter()
         .any(|s| s.request_id == request_id && s.recording.is_some());
     if !active {
@@ -828,7 +870,7 @@ pub async fn record_stop(st: &AppState, request_id: &str) -> Result<String, Stri
 async fn finalize_recording(st: &AppState, request_id: &str, _why: &str) -> Result<String, String> {
     let now = now_ms();
     let (session, label) = {
-        let mut streams = st.telemetry.streams.lock().unwrap_or_else(|e| e.into_inner());
+        let mut streams = lock(&st.telemetry.streams);
         let Some(s) = streams.iter_mut().find(|s| s.request_id == request_id) else {
             return Err("unknown stream".into());
         };
@@ -949,29 +991,27 @@ pub struct Listener {
 
 impl Listener {
     fn running_at(&self, host: &str, port: u16) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lock(&self.inner)
             .as_ref()
             .map(|(h, p, _)| h == host && *p == port)
             .unwrap_or(false)
     }
 
     fn take(&self) -> Option<ListenerHandle> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).take().map(|(_, _, h)| h)
+        lock(&self.inner).take().map(|(_, _, h)| h)
     }
 
     fn store(&self, host: &str, port: u16, handle: ListenerHandle) {
-        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = Some((host.to_string(), port, handle));
+        *lock(&self.inner) = Some((host.to_string(), port, handle));
     }
 }
 
 /// Drop all open stream panels + the status line. Used when the receiver is
 /// turned off and by the UI's clear button; new messages reopen panels.
 pub fn clear(st: &AppState) {
-    st.telemetry.streams.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    st.telemetry.raw.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    *st.telemetry.status.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    lock(&st.telemetry.streams).clear();
+    lock(&st.telemetry.raw).clear();
+    *lock(&st.telemetry.status) = None;
     st.telemetry.last_post_ms.store(0, Ordering::Relaxed);
     st.telemetry.metric_points.store(0, Ordering::Relaxed);
 }
@@ -1080,7 +1120,7 @@ pub async fn simulate(st: AppState, streams: u32, tokens: u32) {
                     "resource_logs": [ { "scope_logs": [ { "log_records": records } ] } ]
                 })).send().await;
                 // stop early if the panel is gone
-                if st2.telemetry.streams.lock().unwrap_or_else(|e| e.into_inner()).iter().all(|s| s.request_id != rid) && k > 5 {
+                if lock(&st2.telemetry.streams).iter().all(|s| s.request_id != rid) && k > 5 {
                     break;
                 }
             }
@@ -1115,105 +1155,138 @@ mod tests {
         }
     }
 
-    #[test]
-    fn append_text_handles_multibyte_utf8_char_boundaries() {
-        let mut s = Stream {
-            request_id: "test-req".into(),
-            generation_id: "".into(),
-            model: "test-model".into(),
-            topology: "test-topo".into(),
-            started_ms: 0.0,
-            last_ms: 0.0,
-            done: false,
-            finish_reason: None,
-            text: String::new(),
-            window_buf: String::new(),
-            engine: fresh_engine(100, 100.0, 1000, 1.0),
-            recording: None,
-        };
+    fn test_stream(rid: &str) -> Stream {
+        Stream::new(rid.into(), String::new(), "model".into(), "tp".into(), 0.0, fresh_engine(100, 100.0, 1000, 1.0))
+    }
 
-        // Fill with multibyte characters (e.g. '§' which is 2 bytes: 0xC2, 0xA7)
-        let chunk = "§\n".repeat(TEXT_CAP_CHARS / 2 + 100);
-        s.append_text(&chunk);
-        assert!(s.text.len() <= TEXT_CAP_CHARS + 10);
-        assert!(s.window_buf.len() <= TEXT_CAP_CHARS + 10);
-        assert!(s.text.is_char_boundary(s.text.len()));
-        assert!(s.window_buf.is_char_boundary(s.window_buf.len()));
+    /// Mixed 1/2/3/4-byte chars, with and without newlines.
+    fn chunk(i: usize) -> String {
+        match i % 4 {
+            0 => format!("line {i}: \u{a7} data \u{20ac}\n"),
+            1 => "\u{1f980}\u{a7}\u{20ac}".repeat(40),
+            2 => format!("tok{i} \u{a7}\u{a7}\u{a7} "),
+            _ => "\u{a7}".repeat(300) + "\n",
+        }
+    }
+
+    /// Apply a tick frame exactly like the frontend's `applyFrame` does
+    /// (minus its own display trim): `full` replaces, otherwise append `delta`.
+    fn apply(client: &mut String, frame: &Value) -> bool {
+        let s = &frame["streams"][0];
+        let full = s["full"].as_bool().unwrap();
+        if full {
+            *client = s["text"].as_str().unwrap().to_string();
+        } else {
+            client.push_str(s["delta"].as_str().unwrap());
+        }
+        full
+    }
+
+    #[test]
+    fn append_text_caps_window_and_tracks_absolute_offset() {
+        let mut s = test_stream("r");
+        let mut reference = String::new();
+        for i in 0..5_000 {
+            let c = chunk(i);
+            reference.push_str(&c);
+            s.append_text(&c);
+            assert!(s.window_buf.len() <= WINDOW_CAP_BYTES);
+            // Absolute offset is append-only: it always equals bytes ever appended.
+            assert_eq!(s.window_end(), reference.len());
+            // The window is exactly the tail of everything appended.
+            assert_eq!(&reference[s.window_base..], s.window_buf);
+        }
+        assert!(s.window_base > 0, "test must cross the cap");
+    }
+
+    #[test]
+    fn append_text_cut_never_splits_a_char_without_newlines() {
+        let mut s = test_stream("r");
+        let mut reference = String::new();
+        // No newlines at all: the cut falls back to a raw byte position,
+        // which must be snapped to a char boundary (4-byte crab + 2-byte \u{a7}).
+        for _ in 0..20_000 {
+            let c = "\u{1f980}\u{a7}";
+            reference.push_str(c);
+            s.append_text(c);
+        }
+        assert!(s.window_base > 0);
+        assert!(reference.is_char_boundary(s.window_base));
+        assert_eq!(&reference[s.window_base..], s.window_buf);
     }
 
     #[tokio::test]
-    async fn tick_frame_cursor_survives_multibyte_and_trimming() {
+    async fn ws_client_text_stays_exact_across_window_trims() {
         let st = test_app_state().await;
+        lock(&st.telemetry.streams).push(test_stream("r"));
+        let mut cursors = Cursors::new();
+        let mut client = String::new();
+        let mut reference = String::new();
 
-        let rid = "req-1";
-        {
-            let mut streams = st.telemetry.streams.lock().unwrap();
-            streams.push(Stream {
-                request_id: rid.into(),
-                generation_id: "".into(),
-                model: "model".into(),
-                topology: "tp".into(),
-                started_ms: 100.0,
-                last_ms: 100.0,
-                done: false,
-                finish_reason: None,
-                text: String::new(),
-                window_buf: String::new(),
-                engine: fresh_engine(100, 100.0, 1000, 1.0),
-                recording: None,
-            });
-        }
-
-        let mut cursors = std::collections::HashMap::new();
-
-        // 1. Initial tick when empty
-        let f1 = tick_frame(&st, &mut cursors).await;
-        assert_eq!(f1["type"], "tick");
-
-        // 2. Append lines containing multibyte '§' characters
-        {
-            let mut streams = st.telemetry.streams.lock().unwrap();
-            let s = &mut streams[0];
-            for i in 0..100 {
-                s.append_text(&format!("line {}: § test data §\n", i));
+        assert!(apply(&mut client, &tick_frame(&st, &mut cursors).await), "first sight is a full sync");
+        let mut fulls = 0;
+        for i in 0..3_000 {
+            let c = chunk(i);
+            reference.push_str(&c);
+            lock(&st.telemetry.streams)[0].append_text(&c);
+            if apply(&mut client, &tick_frame(&st, &mut cursors).await) {
+                fulls += 1;
             }
+            // The client's text must always be an exact tail of the output.
+            assert!(reference.ends_with(&client), "client desynced at chunk {i}");
+            assert!(!client.is_empty());
         }
+        assert!(lock(&st.telemetry.streams)[0].window_base > 0, "test must cross the cap");
+        assert_eq!(fulls, 0, "a connected client keeping up must never need a resync");
+        assert!(client.len() > WINDOW_CAP_BYTES, "deltas accumulate past the server window");
+    }
 
-        // 3. Second tick: first non-empty frame for connection sends full=true and initial text
-        let f2 = tick_frame(&st, &mut cursors).await;
-        let s2 = &f2["streams"][0];
-        assert_eq!(s2["full"], true);
-        assert!(!s2["text"].as_str().unwrap().is_empty());
+    #[tokio::test]
+    async fn stale_cursor_behind_trimmed_window_forces_full_resync() {
+        let st = test_app_state().await;
+        lock(&st.telemetry.streams).push(test_stream("r"));
+        let mut cursors = Cursors::new();
+        let mut client = String::new();
+        apply(&mut client, &tick_frame(&st, &mut cursors).await);
 
-        // 4. Append more lines to exceed default chat_lines window
+        // Append far more than the cap between two ticks: the delivered
+        // offset is now behind window_base, so a delta can't be produced.
+        let mut reference = String::new();
+        for i in 0..2_000 {
+            let c = chunk(i);
+            reference.push_str(&c);
+            lock(&st.telemetry.streams)[0].append_text(&c);
+        }
+        assert!(apply(&mut client, &tick_frame(&st, &mut cursors).await));
+        assert!(reference.ends_with(&client));
+
+        // ...and it resumes with deltas afterwards.
+        lock(&st.telemetry.streams)[0].append_text("tail \u{a7}\n");
+        reference.push_str("tail \u{a7}\n");
+        assert!(!apply(&mut client, &tick_frame(&st, &mut cursors).await));
+        assert!(reference.ends_with(&client));
+    }
+
+    #[tokio::test]
+    async fn cursor_is_not_reused_for_a_new_stream_with_the_same_id() {
+        let st = test_app_state().await;
+        lock(&st.telemetry.streams).push(test_stream("r"));
+        lock(&st.telemetry.streams)[0].append_text("old stream\n");
+        let mut cursors = Cursors::new();
+        let mut client = String::new();
+        apply(&mut client, &tick_frame(&st, &mut cursors).await);
+
+        // Evicted and reopened between two ticks, already longer than the
+        // old cursor: offsets alone would yield a bogus delta.
         {
-            let mut streams = st.telemetry.streams.lock().unwrap();
-            let s = &mut streams[0];
-            for i in 100..200 {
-                s.append_text(&format!("line {}: § more tokens §\n", i));
-            }
+            let mut streams = lock(&st.telemetry.streams);
+            streams.clear();
+            let mut s = test_stream("r");
+            s.append_text("brand new stream output\n");
+            streams.push(s);
         }
-
-        // 5. Third tick: should deliver incremental delta cleanly without char boundary panic
-        let f3 = tick_frame(&st, &mut cursors).await;
-        let s3 = &f3["streams"][0];
-        assert_eq!(s3["full"], false);
-        assert!(!s3["delta"].as_str().unwrap().is_empty());
-
-        // 6. Append another batch of lines with '§'
-        {
-            let mut streams = st.telemetry.streams.lock().unwrap();
-            let s = &mut streams[0];
-            for i in 200..300 {
-                s.append_text(&format!("line {}: § even more §\n", i));
-            }
-        }
-
-        // 7. Fourth tick: should continue delivering deltas
-        let f4 = tick_frame(&st, &mut cursors).await;
-        let s4 = &f4["streams"][0];
-        assert_eq!(s4["full"], false);
-        assert!(!s4["delta"].as_str().unwrap().is_empty());
+        assert!(apply(&mut client, &tick_frame(&st, &mut cursors).await));
+        assert_eq!(client, "brand new stream output\n");
     }
 
     #[tokio::test]
@@ -1230,9 +1303,11 @@ mod tests {
         assert!(st.telemetry.streams.is_poisoned());
 
         // Calling tick_frame should recover the poisoned mutex instead of panicking
-        let mut cursors = std::collections::HashMap::new();
+        let mut cursors = Cursors::new();
         let f = tick_frame(&st, &mut cursors).await;
         assert_eq!(f["type"], "tick");
+        // ...and clear the poison, so it is reported once, not on every lock.
+        assert!(!st.telemetry.streams.is_poisoned());
 
         // Calling snapshot should also recover without panic
         let snap = snapshot(&st).await;
